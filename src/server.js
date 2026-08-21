@@ -38,3 +38,12 @@ app.listen(PORT, () => {
     // Log to console when the server starts successfully
     console.log(`DevPulse running on port ${PORT}`);
 });
+const pool = require("./config/db");
+
+pool.query("SELECT NOW()")
+    .then(result => {
+        console.log("PostgreSQL connected:", result.rows[0]);
+    })
+    .catch(error => {
+        console.error("PostgreSQL connection failed:", error);
+    });

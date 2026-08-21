@@ -1,59 +1,36 @@
-// ======================================================
-// TEMPORARY DATA STORE - Using in-memory array as mock database
-// ======================================================
-// NOTE: This is temporary and will be replaced with PostgreSQL later
-// Currently using a JavaScript array to learn the architecture
+const pool = require("../config/db"); // Shared DB pool used by all repository queries
 
-// Initialize an array to store all projects (mock database)
-const projects = [
-    // Sample project 1 with id, name, and environment
-    {
-        id: 1,
-        name: "FinTrack",
-        environment: "production"
-    },
-    // Sample project 2 with id, name, and environment
-    {
-        id: 2,
-        name: "CampusOS",
-        environment: "development"
-    }
-];
+// GET ALL PROJECTS
+const getAllProjects = async () => {
+    const result = await pool.query(
+        "SELECT * FROM projects ORDER BY id"
+    );
 
-// ======================================================
-// GET ALL PROJECTS FUNCTION
-// ======================================================
-
-// Retrieve all projects from the mock database
-const getAllProjects = () => {
-    // Return the entire projects array
-    return projects;
+    return result.rows;
 };
 
-// ======================================================
-// GET ONE PROJECT FUNCTION
-// ======================================================
+// GET ONE PROJECT
+const getProjectById = async (id) => {
+    const result = await pool.query(
+        "SELECT * FROM projects WHERE id = $1",
+        [id]
+    );
 
-// Retrieve one project from the mock database by ID
-const getProjectById = (id) => {
-    // Find and return the project with the matching ID
-    return projects.find((project) => project.id === id);
+    return result.rows[0];
 };
 
-// ======================================================
-// CREATE PROJECT FUNCTION
-// ======================================================
+// CREATE PROJECT
+const createProject = async (project) => {
+    const result = await pool.query(
+        `INSERT INTO projects (name, environment)
+         VALUES ($1, $2)
+         RETURNING *`,
+        [project.name, project.environment]
+    );
 
-// Add a new project to the mock database
-const createProject = (project) => {
-    // Add the new project to the end of the projects array
-    projects.push(project);
-
-    // Return the newly created project
-    return project;
+    return result.rows[0];
 };
 
-// Export the repository functions for use in other modules
 module.exports = {
     getAllProjects,
     getProjectById,

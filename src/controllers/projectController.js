@@ -6,9 +6,9 @@ const projectService = require("../services/projectService");
 // ======================================================
 
 // Handler for GET /api/projects - retrieves all projects from the data store
-const getProjects = (req, res) => {
+const getProjects = async (req, res) => {
     // Call the service layer to fetch all projects
-    const projects = projectService.getAllProjects();
+    const projects = await projectService.getAllProjects();
 
     // Send the projects array back to the client as JSON
     res.json(projects);
@@ -19,13 +19,13 @@ const getProjects = (req, res) => {
 // ======================================================
 
 // Handler for GET /api/projects/:id - retrieves one project by ID
-const getProjectById = (req, res, next) => {
+const getProjectById = async (req, res, next) => {
     try {
         // Read the project ID from the URL parameters
         const { id } = req.params;
 
         // Call the service layer to fetch the requested project
-        const project = projectService.getProjectById(id);
+        const project =  await projectService.getProjectById(id);
 
         // Send the matching project back to the client as JSON
         res.json(project);
@@ -40,14 +40,14 @@ const getProjectById = (req, res, next) => {
 // ======================================================
 
 // Handler for POST /api/projects - creates a new project
-const createProject = (req, res, next) => {
+const createProject = async (req, res, next) => {
     // Wrap the logic in try-catch to handle errors
     try {
         // Extract name and environment from the request body (JSON payload)
         const { name, environment } = req.body;
 
         // Call the service layer to validate and create the project
-        const project = projectService.createProject(name, environment);
+        const project = await projectService.createProject(name, environment);
 
         // Send the created project back with HTTP 201 (Created) status
         res.status(201).json(project);
