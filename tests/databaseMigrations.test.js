@@ -102,7 +102,8 @@ test("migrations apply once and record each filename once", async () => {
             "001_current_schema.sql",
             "002_project_ownership.sql",
             "003_project_environment_constraint.sql",
-            "004_project_owner_index.sql"
+            "004_project_owner_index.sql",
+            "005_validate_reused_constraints.sql"
         ],
         skipped: []
     });
@@ -241,6 +242,84 @@ test("invalid legacy environment aborts its migration without changing the row",
             "001_current_schema.sql",
             "002_project_ownership.sql"
         ]);
+    } finally {
+        await dropIsolatedSchema(adminPool, isolated.schemaName, isolated.schemaPool);
+    }
+});
+
+test("a weaker existing environment check does not count as the required constraint", async () => {
+    const isolated = await createIsolatedSchema(adminPool);
+    try {
+        await createLegacySchema(isolated.schemaPool, "qa");
+        await isolated.schemaPool.query(`
+            ALTER TABLE projects
+            ADD CONSTRAINT custom_environment_check
+            CHECK (environment IN ('production', 'development', 'qa'))
+        `);
+
+        await assert.rejects(
+            runMigrations({ pool: isolated.schemaPool, migrationsDirectory }),
+            (error) => {
+                assert.match(error.message, /005_validate_reused_constraints\.sql/);
+                assert.equal(error.cause.code, "23514");
+                return true;
+            }
+        );
+
+        const project = await isolated.schemaPool.query(
+            "SELECT environment FROM projects WHERE id = 1"
+        );
+        assert.equal(project.rows[0].environment, "qa");
+    } finally {
+        await dropIsolatedSchema(adminPool, isolated.schemaName, isolated.schemaPool);
+    }
+});
+
+test("an equivalent NOT VALID environment check is validated before migration succeeds", async () => {
+    const isolated = await createIsolatedSchema(adminPool);
+    try {
+        await createLegacySchema(isolated.schemaPool, "qa");
+        await isolated.schemaPool.query(`
+            ALTER TABLE projects
+            ADD CONSTRAINT custom_environment_check
+            CHECK (environment IN ('production', 'development')) NOT VALID
+        `);
+
+        await assert.rejects(
+            runMigrations({ pool: isolated.schemaPool, migrationsDirectory }),
+            (error) => {
+                assert.match(error.message, /005_validate_reused_constraints\.sql/);
+                assert.equal(error.cause.code, "23514");
+                assert.equal(error.cause.constraint, "custom_environment_check");
+                return true;
+            }
+        );
+    } finally {
+        await dropIsolatedSchema(adminPool, isolated.schemaName, isolated.schemaPool);
+    }
+});
+
+test("an equivalent NOT VALID ownership foreign key is validated before migration succeeds", async () => {
+    const isolated = await createIsolatedSchema(adminPool);
+    try {
+        await createLegacySchema(isolated.schemaPool);
+        await isolated.schemaPool.query("ALTER TABLE projects ADD COLUMN owner_id INTEGER");
+        await isolated.schemaPool.query("UPDATE projects SET owner_id = 999999 WHERE id = 1");
+        await isolated.schemaPool.query(`
+            ALTER TABLE projects
+            ADD CONSTRAINT custom_owner_fkey
+            FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE SET NULL NOT VALID
+        `);
+
+        await assert.rejects(
+            runMigrations({ pool: isolated.schemaPool, migrationsDirectory }),
+            (error) => {
+                assert.match(error.message, /005_validate_reused_constraints\.sql/);
+                assert.equal(error.cause.code, "23503");
+                assert.equal(error.cause.constraint, "custom_owner_fkey");
+                return true;
+            }
+        );
     } finally {
         await dropIsolatedSchema(adminPool, isolated.schemaName, isolated.schemaPool);
     }
