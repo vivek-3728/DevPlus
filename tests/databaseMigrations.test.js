@@ -4,6 +4,8 @@ const crypto = require("node:crypto");
 const path = require("node:path");
 const { Pool } = require("pg");
 const { runMigrations } = require("../src/database/migrate");
+const sharedPool = require("../src/config/db");
+const projectRepository = require("../src/repositories/projectRepository");
 
 const migrationsDirectory = path.resolve(__dirname, "../migrations");
 const safeSchemaPattern = /^devpulse_migration_test_[a-f0-9]+$/;
@@ -272,5 +274,43 @@ test("an equivalent owner index with a different name is reused", async () => {
         assert.deepEqual(ownerIndexes.rows, [{ index_name: "custom_owner_lookup" }]);
     } finally {
         await dropIsolatedSchema(adminPool, isolated.schemaName, isolated.schemaPool);
+    }
+});
+
+test("repository LEFT JOIN returns safe owner data and keeps legacy projects", async () => {
+    const owner = await mainPool.query(
+        "INSERT INTO users (name, email, password_hash) VALUES ('Join Owner', 'join-owner@example.com', 'private-hash') RETURNING id"
+    );
+    await mainPool.query(
+        "INSERT INTO projects (name, environment, owner_id) VALUES ('Joined project', 'production', $1)",
+        [owner.rows[0].id]
+    );
+
+    const originalQuery = sharedPool.query;
+    sharedPool.query = (sql, values) => mainPool.query(sql, values);
+    try {
+        const projects = await projectRepository.getProjectsWithOwners();
+        const legacy = projects.find((project) => project.project_id === 1);
+        const joined = projects.find((project) => project.project_name === "Joined project");
+
+        assert.deepEqual(legacy, {
+            project_id: 1,
+            project_name: "Legacy project",
+            environment: "development",
+            owner_id: null,
+            owner_name: null,
+            owner_email: null
+        });
+        assert.deepEqual(joined, {
+            project_id: joined.project_id,
+            project_name: "Joined project",
+            environment: "production",
+            owner_id: owner.rows[0].id,
+            owner_name: "Join Owner",
+            owner_email: "join-owner@example.com"
+        });
+        assert.equal(projects.every((project) => !Object.hasOwn(project, "password_hash")), true);
+    } finally {
+        sharedPool.query = originalQuery;
     }
 });
