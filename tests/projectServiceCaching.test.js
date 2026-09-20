@@ -1,11 +1,16 @@
 const { test, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
 const projectRepository = require("../src/repositories/projectRepository");
+const redisConfig = require("../src/config/redis");
 const projectCache = require("../src/services/projectCache");
 const projectService = require("../src/services/projectService");
 
 const originalRepository = { ...projectRepository };
 const originalCache = { ...projectCache };
+const originalRedisClient = redisConfig.redisClient;
+const originalRedisTimeout = redisConfig.getRedisOperationTimeoutMs;
+const originalRecycleRedisClient = redisConfig.recycleRedisClient;
+const originalWarn = console.warn;
 
 afterEach(() => {
     for (const [name, implementation] of Object.entries(originalRepository)) {
@@ -14,6 +19,18 @@ afterEach(() => {
     for (const [name, implementation] of Object.entries(originalCache)) {
         projectCache[name] = implementation;
     }
+    redisConfig.redisClient = originalRedisClient;
+    if (originalRedisTimeout === undefined) {
+        delete redisConfig.getRedisOperationTimeoutMs;
+    } else {
+        redisConfig.getRedisOperationTimeoutMs = originalRedisTimeout;
+    }
+    if (originalRecycleRedisClient === undefined) {
+        delete redisConfig.recycleRedisClient;
+    } else {
+        redisConfig.recycleRedisClient = originalRecycleRedisClient;
+    }
+    console.warn = originalWarn;
 });
 
 const user = { userId: 31, role: "user" };
@@ -24,6 +41,13 @@ const owned = {
     environment: "development",
     owner_id: 31
 };
+
+const withTestDeadline = (promise, milliseconds = 100) => Promise.race([
+    promise,
+    new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("test deadline exceeded")), milliseconds);
+    })
+]);
 
 test("cache miss queries PostgreSQL and caches only the authorized project", async () => {
     const writes = [];
@@ -172,6 +196,56 @@ test("Redis miss or failed cache population still returns PostgreSQL data", asyn
     assert.equal(cacheReads, 1);
 });
 
+test("a Redis GET that stops responding falls back to PostgreSQL", async () => {
+    console.warn = () => {};
+    let databaseReads = 0;
+    let recycledClients = 0;
+    redisConfig.redisClient = {
+        isReady: true,
+        get: async () => new Promise(() => {}),
+        destroy: () => {}
+    };
+    redisConfig.getRedisOperationTimeoutMs = () => 10;
+    redisConfig.recycleRedisClient = () => {
+        recycledClients += 1;
+        redisConfig.redisClient = null;
+    };
+    projectRepository.getProjectById = async () => {
+        databaseReads += 1;
+        return owned;
+    };
+
+    assert.deepEqual(
+        await withTestDeadline(projectService.getProjectById("7", user)),
+        owned
+    );
+    assert.equal(databaseReads, 1);
+    assert.equal(recycledClients, 1);
+});
+
+test("a Redis SET that stops responding does not block a PostgreSQL read", async () => {
+    console.warn = () => {};
+    let recycledClients = 0;
+    redisConfig.redisClient = {
+        isReady: true,
+        get: async () => null,
+        set: async () => new Promise(() => {}),
+        destroy: () => {}
+    };
+    redisConfig.getRedisOperationTimeoutMs = () => 10;
+    redisConfig.recycleRedisClient = () => {
+        recycledClients += 1;
+        redisConfig.redisClient = null;
+    };
+    projectRepository.getProjectById = async () => owned;
+
+    assert.deepEqual(
+        await withTestDeadline(projectService.getProjectById("7", user)),
+        owned
+    );
+    assert.equal(recycledClients, 1);
+});
+
 test("paginated list queries never use the individual-project cache", async () => {
     let cacheCalls = 0;
     projectCache.getProject = async () => { cacheCalls += 1; };
@@ -287,4 +361,30 @@ test("cache invalidation failure does not change successful database responses",
         updated
     );
     await assert.doesNotReject(projectService.deleteProject("7", user));
+});
+
+test("a Redis DEL that stops responding does not block a successful update", async () => {
+    console.warn = () => {};
+    const updated = { ...owned, name: "Updated", environment: "production" };
+    let recycledClients = 0;
+    redisConfig.redisClient = {
+        isReady: true,
+        del: async () => new Promise(() => {}),
+        destroy: () => {}
+    };
+    redisConfig.getRedisOperationTimeoutMs = () => 10;
+    redisConfig.recycleRedisClient = () => {
+        recycledClients += 1;
+        redisConfig.redisClient = null;
+    };
+    projectRepository.getProjectById = async () => owned;
+    projectRepository.updateProject = async () => updated;
+
+    assert.deepEqual(
+        await withTestDeadline(
+            projectService.updateProject("7", "Updated", "production", user)
+        ),
+        updated
+    );
+    assert.equal(recycledClients, 1);
 });
