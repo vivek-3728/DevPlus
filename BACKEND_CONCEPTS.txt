@@ -232,3 +232,19 @@ INDEX REVIEW
 - No extra project-query indexes were added without measured evidence that
   their read benefit is needed. Every extra index consumes space and adds work
   to INSERT and UPDATE operations.
+
+CACHE-ASIDE WITH REDIS
+- PostgreSQL remains the source of truth. Redis stores temporary copies only.
+- On a cache hit, an authorized individual project can be returned without a
+  PostgreSQL query. On a miss, PostgreSQL is read and the successful result is
+  placed in Redis for the configured TTL (time to live).
+- Cache keys include the authenticated user or administrator scope. The service
+  still checks the cached project's ID and ownership before returning it.
+- Successful updates and deletes invalidate the administrator key and the
+  owner's key only after PostgreSQL succeeds.
+- Redis failures fall back to PostgreSQL. If invalidation fails, a stale entry
+  can remain until its TTL expires; this is the availability trade-off of using
+  Redis as an optional optimization.
+- Caching saves repeated database reads, but serialization, network calls, and
+  invalidation add complexity. The paginated/search list is intentionally not
+  cached because its many query combinations would be harder to invalidate.

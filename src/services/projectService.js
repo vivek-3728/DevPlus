@@ -181,22 +181,28 @@ const createProject = async (name, environment, actor) => {
 const updateProject = async (id, name, environment, actor) => {
     const projectId = validateId(id);
     validateProject(name, environment);
-    await getAuthorizedProject(projectId, actor);
+    const existingProject = await getAuthorizedProject(projectId, actor);
     // UPDATE ... RETURNING tells us whether a row existed in the same query.
     const project = await projectRepository.updateProject(projectId, { name, environment });
     if (!project) {
         throw new Apperror("Project not found", 404);
     }
+
+    // PostgreSQL must succeed first because it is the source of truth. The
+    // cache service treats Redis DEL failures as non-fatal and the short TTL
+    // still limits how long a stale value can remain.
+    await projectCache.invalidateProject(projectId, existingProject.owner_id);
     return project;
 };
 
 const deleteProject = async (id, actor) => {
     const projectId = validateId(id);
-    await getAuthorizedProject(projectId, actor);
+    const existingProject = await getAuthorizedProject(projectId, actor);
     const project = await projectRepository.deleteProject(projectId);
     if (!project) {
         throw new Apperror("Project not found", 404);
     }
+    await projectCache.invalidateProject(projectId, existingProject.owner_id);
 };
 
 module.exports = {

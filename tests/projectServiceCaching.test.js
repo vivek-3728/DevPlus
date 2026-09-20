@@ -182,3 +182,109 @@ test("paginated list queries never use the individual-project cache", async () =
     assert.deepEqual(result.projects, [owned]);
     assert.equal(cacheCalls, 0);
 });
+
+test("update invalidates owner and admin caches after PostgreSQL succeeds", async () => {
+    const order = [];
+    const invalidations = [];
+    const updated = { ...owned, name: "Updated", environment: "production" };
+    projectRepository.getProjectById = async () => owned;
+    projectRepository.updateProject = async () => {
+        order.push("database");
+        return updated;
+    };
+    projectCache.invalidateProject = async (...args) => {
+        order.push("cache");
+        invalidations.push(args);
+        return true;
+    };
+
+    assert.deepEqual(
+        await projectService.updateProject("7", "Updated", "production", user),
+        updated
+    );
+    assert.deepEqual(order, ["database", "cache"]);
+    assert.deepEqual(invalidations, [[7, 31]]);
+});
+
+test("failed PostgreSQL update does not invalidate cache", async () => {
+    const databaseError = new Error("update failed");
+    let invalidations = 0;
+    projectRepository.getProjectById = async () => owned;
+    projectRepository.updateProject = async () => { throw databaseError; };
+    projectCache.invalidateProject = async () => { invalidations += 1; };
+
+    await assert.rejects(
+        projectService.updateProject("7", "Updated", "production", user),
+        (error) => error === databaseError
+    );
+    assert.equal(invalidations, 0);
+});
+
+test("delete invalidates owner and admin caches after PostgreSQL succeeds", async () => {
+    const order = [];
+    const invalidations = [];
+    projectRepository.getProjectById = async () => owned;
+    projectRepository.deleteProject = async () => {
+        order.push("database");
+        return { id: 7 };
+    };
+    projectCache.invalidateProject = async (...args) => {
+        order.push("cache");
+        invalidations.push(args);
+        return true;
+    };
+
+    await projectService.deleteProject("7", user);
+    assert.deepEqual(order, ["database", "cache"]);
+    assert.deepEqual(invalidations, [[7, 31]]);
+});
+
+test("missing delete result and unauthorized mutations do not invalidate cache", async () => {
+    let invalidations = 0;
+    projectCache.invalidateProject = async () => { invalidations += 1; };
+    projectRepository.getProjectById = async () => owned;
+    projectRepository.deleteProject = async () => undefined;
+
+    await assert.rejects(
+        projectService.deleteProject("7", user),
+        (error) => error.statusCode === 404
+    );
+
+    projectRepository.getProjectById = async () => ({ ...owned, owner_id: 44 });
+    await assert.rejects(
+        projectService.updateProject("7", "Updated", "production", user),
+        (error) => error.statusCode === 403
+    );
+    assert.equal(invalidations, 0);
+});
+
+test("admin mutations invalidate the actual owner scope including legacy NULL", async () => {
+    const invalidations = [];
+    projectCache.invalidateProject = async (...args) => {
+        invalidations.push(args);
+        return true;
+    };
+    projectRepository.getProjectById = async () => ({ ...owned, owner_id: 44 });
+    projectRepository.updateProject = async () => ({ ...owned, owner_id: 44 });
+    await projectService.updateProject("7", "Updated", "production", admin);
+
+    projectRepository.getProjectById = async () => ({ ...owned, owner_id: null });
+    projectRepository.deleteProject = async () => ({ id: 7 });
+    await projectService.deleteProject("7", admin);
+
+    assert.deepEqual(invalidations, [[7, 44], [7, null]]);
+});
+
+test("cache invalidation failure does not change successful database responses", async () => {
+    const updated = { ...owned, name: "Updated", environment: "production" };
+    projectRepository.getProjectById = async () => owned;
+    projectRepository.updateProject = async () => updated;
+    projectRepository.deleteProject = async () => ({ id: 7 });
+    projectCache.invalidateProject = async () => false;
+
+    assert.deepEqual(
+        await projectService.updateProject("7", "Updated", "production", user),
+        updated
+    );
+    await assert.doesNotReject(projectService.deleteProject("7", user));
+});
