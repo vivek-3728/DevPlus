@@ -1,0 +1,234 @@
+DEVPULSE - BACKEND CONCEPTS AND PHASE 2 CRUD
+============================================================
+
+CURRENT STATUS
+The code implements create, list, read one, update, and delete for projects.
+The automated HTTP tests replace only the external PostgreSQL query boundary.
+Live database verification was attempted but PostgreSQL rejected the configured
+credentials: password authentication failed for user "postgres".
+No schema changes were made. Schema compatibility and live persistence remain
+unverified until working database access is available. The SQL expects a projects
+table with id, name, environment and a database-generated default for id.
+
+WHAT CHANGED IN PHASE 2
+1. src/services/projectService.js
+   The single-project lookup now awaits the database result before checking it.
+   Previously it checked a truthy Promise, so missing rows did not produce 404.
+   Creation no longer reads every project or calculates length + 1 as an ID.
+   That old read returned a Promise, making the calculation NaN; INSERT ignored
+   that value anyway. Creation now sends only name/environment to the repository.
+   Added common validation: decimal positive safe integer IDs, a string name
+   with at least one non-whitespace character, and an environment of exactly
+   production or development. Names are checked with trim(), but stored as sent.
+   Added updateProject and deleteProject. They await the changed/deleted row
+   before deciding whether to throw a Project not found error with status 404.
+
+2. src/repositories/projectRepository.js
+   Retained the existing SELECT and INSERT operations.
+   Added UPDATE projects SET name = $1, environment = $2 WHERE id = $3 RETURNING *.
+   Added DELETE FROM projects WHERE id = $1 RETURNING id.
+   Every user value is passed separately from SQL text. Each change uses one
+   statement; there is no separate existence query that could become outdated
+   before the update/delete runs. No database schema is created or altered.
+
+3. src/controllers/projectController.js
+   Added update and delete HTTP handlers. Update sends the saved row with 200.
+   Delete sends 204 and ends the response without a JSON body.
+   Create/update use req.body ?? {} so an absent body reaches validation instead
+   of crashing while extracting fields. Errors go to the central error handler.
+
+4. src/routes/projectRoutes.js
+   Added PUT /:id and DELETE /:id, under the existing /api/projects prefix.
+   PUT requires both editable fields. Existing GET and POST routes remain.
+
+5. package.json and tests/projects.test.js
+   Replaced the placeholder failing test script with node --test.
+   npm test runs 52 HTTP tests using Node's built-in runner, no new dependency.
+   Tests exercise real routes, controllers, services, repositories and error
+   middleware. Only pool.query is substituted because live DB access failed.
+   Covered: reads, empty lists, missing rows, invalid IDs, missing/invalid bodies,
+   single-query creation, update SQL parameters, deletion, malformed JSON and
+   database failures. They check response status/body and SQL values, but do
+   not prove PostgreSQL accepted the SQL or that records persisted on disk.
+   Before implementation: 15 passed, 37 failed. After implementation: 52 passed.
+
+6. This guide and source comments
+   Updated explanations to match the corrected behavior and new CRUD operations.
+   Other existing server/configuration/middleware comments from the earlier
+   documentation task remain. Database configuration was not changed in Phase 2.
+
+ENDPOINT REFERENCE
+Method  Path                  Meaning                    Successful response
+GET     /api/projects         List projects ordered by ID 200, JSON array
+GET     /api/projects/:id     Read one project            200, JSON object
+POST    /api/projects         Create a project            201, JSON object
+PUT     /api/projects/:id     Replace name/environment    200, JSON object
+DELETE  /api/projects/:id     Delete one project          204, empty body
+GET     /api/health           Check HTTP availability     200, static JSON
+
+POST and PUT example body (Content-Type: application/json):
+{"name":"DevPulse","environment":"development"}
+PUT requires both fields and does not change the ID. Extra body fields are not
+passed to the repository. There is no PATCH endpoint for partial updates.
+Invalid input: 400. Missing project for GET/PUT/DELETE: 404.
+Unexpected errors: 500 with a generic message, details logged on the server.
+
+COMPLETE REQUEST FLOW, IN SIMPLE LANGUAGE
+Client -> JSON parser -> logger -> router -> controller -> service
+       -> repository -> PostgreSQL -> repository -> service -> controller
+       -> HTTP response -> logger's finish callback
+
+Example: PUT /api/projects/3 with the JSON body above.
+1. The server receives the HTTP request. express.json() reads JSON into req.body.
+2. The logger remembers the start time and calls next() to continue processing.
+3. The router matches PUT /:id. Express sets req.params.id to the string "3".
+4. The controller extracts name/environment and passes them and the ID to the
+   service. It awaits the result, so it does not respond before the query ends.
+5. The service validates the ID and both fields. Invalid input throws Apperror.
+6. The repository sends the parameterized UPDATE and its values to PostgreSQL
+   through the connection pool. Only the row matching ID 3 is eligible to change.
+7. PostgreSQL returns the updated row via RETURNING *. The repository extracts
+   result.rows[0]. If no row matched, that value is undefined instead.
+8. The service turns a missing row into 404; otherwise it returns the saved row.
+9. The controller sends the row as JSON with 200. The finish callback logs the
+   method, URL, final status and elapsed time after server response completion.
+
+How the other operations differ:
+- List: SELECT ordered by ID -> rows array -> 200 (an empty array is valid).
+- Read one: validate ID -> SELECT -> row or 404 -> 200 JSON on success.
+- Create: validate fields -> INSERT -> database-generated ID in returned row
+  -> 201 JSON. No manual ID generation and no extra list query.
+- Delete: validate ID -> DELETE ... RETURNING id -> 404 if absent, otherwise
+  204 with no body. A repeated delete of the same now-missing ID returns 404.
+
+Error path:
+A failed validation or rejected awaited query reaches the controller catch,
+which calls next(error). The final error middleware logs it and sends JSON.
+The async list handler relies on Express 5 to forward its rejected Promise.
+Malformed JSON fails in the parser before the logger/routes and returns 400.
+Operational errors use their stored status/message. Unexpected database/internal
+errors return only {"error":"Internal Server Error"} with status 500.
+
+BACKEND CONCEPTS: WHERE AND HOW
+
+1. Node.js, npm and CommonJS modules
+Where: package.json and every src JavaScript module.
+How: Node runs JavaScript on the server; npm manages dependencies and scripts.
+require() imports modules; module.exports makes functions/objects available.
+The package uses CommonJS. Dependencies are Express, pg and dotenv; nodemon is
+available for development. No start/dev script is configured; run from the root:
+node src/server.js
+The package main field still says index.js, which is not present.
+
+2. HTTP server and environment configuration
+Where: src/server.js, src/services/server.js and src/config/db.js.
+How: express() creates an app; app.listen() listens on process.env.PORT or 5000.
+dotenv loads .env values, but db.js still uses hardcoded connection settings.
+src/services/server.js is a duplicate alternate entry point, not a business
+service. Both use the same project router; do not run both on the same port.
+
+3. Layered architecture
+Where: src/routes, src/controllers, src/services, src/repositories, src/config.
+How: Routes choose handlers; controllers handle HTTP; services enforce project
+rules; repositories execute SQL; config creates the shared database pool.
+This separates responsibilities so changing SQL does not require writing it
+inside a route, and validation is shared between create and update.
+
+4. Resource-based routing and CRUD
+Where: src/routes/projectRoutes.js.
+How: HTTP methods describe create/read/update/delete on project resources.
+The server mounts the router at /api/projects. :id captures a specific resource.
+The endpoint reference above lists the complete currently implemented API.
+
+5. JSON and response status codes
+Where: server express.json(), projectController.js, errorHandler.js.
+How: JSON body parsing populates req.body. res.json() serializes results.
+201 indicates creation; 204 indicates success with no body. 400 is bad input,
+404 is a missing project, and 500 is an unexpected server failure.
+
+6. Input validation
+Where: validateId() and validateProject() in projectService.js.
+How: Invalid values are rejected before SQL runs. IDs must use decimal digits
+and be positive safe integers. Names must be nonblank strings; environments
+must match one of two allowed values. Database column lengths/types may impose
+additional constraints; these remain unverified without database access.
+
+7. Relational persistence and connection pooling
+Where: src/config/db.js and src/repositories/projectRepository.js.
+How: pg.Pool reuses PostgreSQL connections between queries. CommonJS caching
+means callers share the exported pool in this process. SELECT reads records;
+INSERT creates, UPDATE changes and DELETE removes them. Database-generated IDs
+avoid counting existing records, which is unreliable after deletions or during
+simultaneous creates. The actual existing ID default is not yet verified.
+
+8. Parameterized SQL and RETURNING
+Where: projectRepository.js.
+How: $1/$2/$3 placeholders get their data from a separate values array. A quote
+or SQL-looking text in a name remains data rather than becoming SQL commands.
+RETURNING supplies the affected row without an additional read. WHERE id limits
+updates/deletes to the requested ID, assuming the expected unique/primary key.
+
+9. Promises and async/await
+Where: repository queries, services, controllers, server startup check.
+How: Database I/O takes time. A Promise represents its future result; await
+waits within that function without blocking other requests. Always await before
+inspecting a returned row. A function can simply return the Promise if its
+caller will await it and no local inspection is needed.
+
+10. Middleware, callbacks and closures
+Where: server app.use() registrations and src/middleware/logger.js.
+How: next() passes control along the chain. The finish callback remembers each
+request's start time through a closure. It logs elapsed server time after the
+response is handed off, not after the client has read it. Parsing comes before
+logging, so malformed JSON may bypass the logger.
+
+11. Custom errors and central error handling
+Where: src/errors/Apperror.js and src/middleware/errorHandler.js.
+How: Apperror extends Error with statusCode and isOperational. The handler has
+four parameters so Express recognizes it as error middleware. It checks the
+operational flag (the imported Apperror class is not used for instanceof).
+Early returns prevent a second response. Stack traces aid server debugging.
+
+12. Health checks and startup diagnostics
+Where: src/server.js and the alternate src/services/server.js.
+How: /api/health sends a static success message; it does not check the database.
+The main server separately runs SELECT NOW() and logs success/failure after
+starting the listener. A DB failure does not stop HTTP startup. The alternate
+entry point omits that explicit query. HTTP health is not database readiness.
+
+13. Automated regression tests
+Where: tests/projects.test.js; command: npm test.
+How: A temporary local HTTP listener exposes the actual project router during
+tests. Requests check observable responses and the SQL boundary. Tests replace
+pool.query and restore it on cleanup, close the listener, and end the pool.
+The suite protects against reintroducing the missing-await bug and incomplete
+CRUD behavior. Live database integration must be checked separately once access
+works; no schema migration or real project deletion is performed by these tests.
+
+NOT IMPLEMENTED
+Authentication, authorization, pagination/search, caching, rate limiting,
+explicit CORS configuration, migrations, explicit multi-query transactions,
+file uploads, background jobs, and deployment configuration are not implemented.
+Any database constraints outside the source repository remain unverified.
+
+POSTGRESQL TRANSACTIONS
+- BEGIN starts one all-or-nothing unit of database work.
+- COMMIT makes every write permanent after all related writes succeed.
+- ROLLBACK undoes writes made since BEGIN when a later step fails.
+- Every statement in a transaction must use the same checked-out client.
+  Separate pool.query() calls could use different connections and therefore
+  would not be part of the same transaction.
+- A finally block releases the client on both success and failure so the pool
+  does not eventually run out of available connections.
+
+INDEX REVIEW
+- Each primary key already has an index, which supports fast ID lookups.
+- idx_projects_owner_id supports the ownership filter that every normal-user
+  project list query applies.
+- Environment has only two possible values, so a standalone environment index
+  would usually match too many rows to be selective.
+- Project-name search uses a leading-wildcard ILIKE pattern. A normal B-tree
+  index cannot effectively speed up that pattern.
+- No extra project-query indexes were added without measured evidence that
+  their read benefit is needed. Every extra index consumes space and adds work
+  to INSERT and UPDATE operations.
