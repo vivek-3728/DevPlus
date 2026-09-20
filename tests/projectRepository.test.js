@@ -129,7 +129,8 @@ test("createProject attempts rollback and releases the client when commit fails"
 
 test("createProject preserves the write error and releases when rollback also fails", async () => {
     const auditError = new Error("audit insert failed");
-    let releases = 0;
+    const rollbackError = new Error("rollback failed");
+    const releaseArguments = [];
     pool.connect = async () => ({
         query: async (sql) => {
             const normalizedSql = sql.replace(/\s+/g, " ").trim();
@@ -137,10 +138,10 @@ test("createProject preserves the write error and releases when rollback also fa
                 return { rows: [{ id: 8 }] };
             }
             if (/^INSERT INTO project_audit_log/i.test(normalizedSql)) throw auditError;
-            if (normalizedSql === "ROLLBACK") throw new Error("rollback failed");
+            if (normalizedSql === "ROLLBACK") throw rollbackError;
             return { rows: [] };
         },
-        release: () => { releases += 1; }
+        release: (error) => { releaseArguments.push(error); }
     });
     pool.query = async () => { throw new Error("createProject bypassed the checked-out client"); };
 
@@ -150,7 +151,9 @@ test("createProject preserves the write error and releases when rollback also fa
         }),
         (error) => error === auditError
     );
-    assert.equal(releases, 1);
+    // Passing the rollback error to release(error) tells pg-pool to destroy
+    // this unsafe connection instead of giving it to another request.
+    assert.deepEqual(releaseArguments, [rollbackError]);
 });
 
 test("update and delete never transfer ownership", async () => {

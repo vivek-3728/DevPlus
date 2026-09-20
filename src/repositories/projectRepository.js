@@ -93,6 +93,7 @@ const createProject = async (project) => {
     // calls might use different connections and therefore different transactions.
     const client = await pool.connect();
     let transactionStarted = false;
+    let releaseError;
 
     try {
         // BEGIN starts one all-or-nothing unit of work.
@@ -125,15 +126,18 @@ const createProject = async (project) => {
                 // ROLLBACK removes the project insert if the audit insert or
                 // commit fails, keeping the two related writes consistent.
                 await client.query("ROLLBACK");
-            } catch {
+            } catch (rollbackError) {
                 // Keep the original failure as the useful application error.
-                // The finally block still releases this connection.
+                // Passing the rollback error to release(error) also tells
+                // pg-pool to destroy this unsafe connection instead of reusing it.
+                releaseError = rollbackError;
             }
         }
         throw error;
     } finally {
-        // Always return the connection to the pool, on success or failure.
-        client.release();
+        // A normal connection returns to the pool. If ROLLBACK failed,
+        // release(error) removes the unsafe connection from the pool instead.
+        client.release(releaseError);
     }
 };
 
