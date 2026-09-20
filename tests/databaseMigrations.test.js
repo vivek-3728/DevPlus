@@ -103,7 +103,8 @@ test("migrations apply once and record each filename once", async () => {
             "002_project_ownership.sql",
             "003_project_environment_constraint.sql",
             "004_project_owner_index.sql",
-            "005_validate_reused_constraints.sql"
+            "005_validate_reused_constraints.sql",
+            "006_project_audit_log.sql"
         ],
         skipped: []
     });
@@ -127,6 +128,60 @@ test("migration preserves the legacy project with nullable ownership", async () 
         name: "Legacy project",
         environment: "development",
         owner_id: null
+    });
+});
+
+test("audit migration preserves snapshots and nullable relationships", async () => {
+    const user = await mainPool.query(
+        "INSERT INTO users (name, email, password_hash) VALUES ('Auditor', 'auditor@example.com', 'hash') RETURNING id"
+    );
+    const project = await mainPool.query(
+        "INSERT INTO projects (name, environment, owner_id) VALUES ('Audited', 'production', $1) RETURNING id",
+        [user.rows[0].id]
+    );
+    const audit = await mainPool.query(
+        `INSERT INTO project_audit_log
+            (project_id, action, actor_user_id, project_name, environment)
+         VALUES ($1, 'created', $2, 'Audited', 'production')
+         RETURNING id, project_id, action, actor_user_id, project_name, environment`,
+        [project.rows[0].id, user.rows[0].id]
+    );
+
+    const { id: auditId, ...auditRow } = audit.rows[0];
+    assert.match(auditId, /^\d+$/); // BIGSERIAL values arrive from pg as text.
+    assert.deepEqual(auditRow, {
+        project_id: project.rows[0].id,
+        action: "created",
+        actor_user_id: user.rows[0].id,
+        project_name: "Audited",
+        environment: "production"
+    });
+
+    await expectPostgresCode(
+        mainPool.query(
+            `INSERT INTO project_audit_log (action, project_name, environment)
+             VALUES ('updated', 'Invalid action', 'production')`
+        ),
+        "23514"
+    );
+    await expectPostgresCode(
+        mainPool.query(
+            `INSERT INTO project_audit_log (action, project_name, environment)
+             VALUES ('created', 'Invalid environment', 'staging')`
+        ),
+        "23514"
+    );
+
+    await mainPool.query("DELETE FROM projects WHERE id = $1", [project.rows[0].id]);
+    await mainPool.query("DELETE FROM users WHERE id = $1", [user.rows[0].id]);
+    const retained = await mainPool.query(
+        "SELECT project_id, actor_user_id, project_name FROM project_audit_log WHERE id = $1",
+        [auditId]
+    );
+    assert.deepEqual(retained.rows[0], {
+        project_id: null,
+        actor_user_id: null,
+        project_name: "Audited"
     });
 });
 
