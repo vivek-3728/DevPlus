@@ -1,6 +1,7 @@
 // Services contain project rules. They do not read HTTP requests or write SQL.
 const projectRepository = require("../repositories/projectRepository");
 const projectCache = require("./projectCache");
+const { runSingleFlight } = require("./cacheSingleFlight");
 const Apperror = require("../errors/Apperror");
 
 // URL parameters are strings. Accept decimal positive integers that JavaScript
@@ -62,12 +63,27 @@ const isUsableCachedProject = (project, projectId, actor) => {
         && typeof project.name === "string"
         && ALLOWED_ENVIRONMENTS.has(project.environment)
         && (project.owner_id === null
-            || (Number.isSafeInteger(project.owner_id) && project.owner_id > 0));
+            || (Number.isSafeInteger(project.owner_id) && project.owner_id > 0))
+        && (project.created_at === undefined
+            || typeof project.created_at === "string");
 
     return hasProjectShape
         && project.id === projectId
         && actorCanAccessProject(project, actor);
 };
+
+// Cache hits are projected onto the public project shape. Redis is not trusted
+// to decide which fields the API may expose, so unexpected authentication or
+// internal properties are discarded.
+const toPublicProject = (project) => ({
+    id: project.id,
+    name: project.name,
+    environment: project.environment,
+    owner_id: project.owner_id,
+    ...(project.created_at === undefined
+        ? {}
+        : { created_at: project.created_at })
+});
 
 const ALLOWED_SORT_COLUMNS = new Set(["id", "name", "environment", "created_at"]);
 const ALLOWED_SORT_ORDERS = new Set(["asc", "desc"]);
@@ -138,44 +154,120 @@ const normalizeProjectQuery = (rawQuery = {}) => {
 
 const getProjects = async (rawQuery, actor) => {
     const query = normalizeProjectQuery(rawQuery);
+    const cachedList = await projectCache.getProjectList(query, actor);
 
+    // Redis data is serialized external input, so validate both pagination
+    // metadata and every row's ownership before returning a cached response.
+    // Actor-scoped keys are the first boundary; this check is a second one.
+        const cachedEnvelope = cachedList?.value;
+        const cachedResponse = cachedEnvelope?.response;
+        const isUsableCachedList = cachedEnvelope !== null
+            && typeof cachedEnvelope === "object"
+            && !Array.isArray(cachedEnvelope)
+            && cachedEnvelope.queryFingerprint
+                === projectCache.buildProjectListQueryFingerprint(query)
+            && cachedResponse !== null
+            && typeof cachedResponse === "object"
+            && !Array.isArray(cachedResponse)
+            && cachedResponse.page === query.page
+            && cachedResponse.limit === query.limit
+            && Number.isSafeInteger(cachedResponse.total)
+            && cachedResponse.total >= 0
+            && cachedResponse.totalPages
+                === Math.ceil(cachedResponse.total / query.limit)
+            && Array.isArray(cachedResponse.projects)
+            && cachedResponse.projects.length <= query.limit
+            && cachedResponse.projects.length <= cachedResponse.total
+            && cachedResponse.projects.every((project) =>
+                isUsableCachedProject(project, project?.id, actor));
+
+        if (isUsableCachedList) {
+        // Return only the public project fields. This prevents an accidentally
+        // polluted Redis value from adding internal properties to the API.
+            return {
+                page: cachedResponse.page,
+                limit: cachedResponse.limit,
+                total: cachedResponse.total,
+                totalPages: cachedResponse.totalPages,
+                projects: cachedResponse.projects.map(toPublicProject)
+            };
+        }
+
+    const loadFromDatabase = async () => {
     // The owner restriction is part of both SQL queries. This prevents counts
     // and empty/non-empty pages from revealing another user's projects.
-    const result = await projectRepository.queryProjects({
-        ...query,
-        ownerId: actor.role === "admin" ? undefined : actor.userId
-    });
+        const result = await projectRepository.queryProjects({
+            ...query,
+            ownerId: actor.role === "admin" ? undefined : actor.userId
+        });
 
-    return {
-        page: query.page,
-        limit: query.limit,
-        total: result.total,
-        totalPages: Math.ceil(result.total / query.limit),
-        projects: result.projects
+        const response = {
+            page: query.page,
+            limit: query.limit,
+            total: result.total,
+            totalPages: Math.ceil(result.total / query.limit),
+            projects: result.projects
+        };
+
+    // A failed Redis read returns no cache key. PostgreSQL still serves the
+    // request, but we avoid a second Redis attempt during the same failure.
+        if (cachedList?.cacheKey) {
+            await projectCache.setProjectList(cachedList.cacheKey, query, response);
+        }
+        return response;
     };
+
+    // The exact versioned cache key is also the single-flight boundary. If a
+    // mutation advances the namespace, a later request gets a different key
+    // and cannot join work that started before the mutation completed.
+    return cachedList?.cacheKey
+        ? runSingleFlight(`load:${cachedList.cacheKey}`, loadFromDatabase)
+        : loadFromDatabase();
 };
 
 const getProjectById = async (id, actor) => {
     const projectId = validateId(id);
     const cachedProject = await projectCache.getProject(projectId, actor);
+    const cachedValue = cachedProject?.value;
 
-    // Actor-scoped keys are the first isolation boundary. This ownership check
-    // is a second boundary, so even a misplaced cache value cannot grant access.
-    if (isUsableCachedProject(cachedProject, projectId, actor)) {
-        return cachedProject;
+    // Actor-scoped keys are the first isolation boundary. This ownership
+    // check is a second boundary, so a misplaced value cannot grant access.
+    if (isUsableCachedProject(cachedValue, projectId, actor)) {
+        return toPublicProject(cachedValue);
     }
 
-    // Cache miss: read and authorize the source-of-truth row before caching it.
-    // Consequently 403, 404, and PostgreSQL failures never become cache values.
-    const project = await getAuthorizedProject(projectId, actor);
-    await projectCache.setProject(project, actor);
-    return project;
+    const loadFromDatabase = async () => {
+        // Cache miss: read and authorize PostgreSQL before caching. The exact
+        // versioned miss key prevents a concurrent mutation from making this
+        // older result active after invalidation.
+        const project = await getAuthorizedProject(projectId, actor);
+        if (cachedProject?.cacheKey) {
+            await projectCache.setProject(cachedProject.cacheKey, project);
+        }
+        return project;
+    };
+
+    // Do not use a permanent logical flight key: it would let a request that
+    // starts after invalidation join an older load. Redis failures provide no
+    // trustworthy version context, so those requests simply use PostgreSQL.
+    return cachedProject?.cacheKey
+        ? runSingleFlight(`load:${cachedProject.cacheKey}`, loadFromDatabase)
+        : loadFromDatabase();
 };
 
 const createProject = async (name, environment, actor) => {
     validateProject(name, environment);
     // ownerId comes only from the verified JWT actor, never from req.body.
-    return projectRepository.createProject({ name, environment, ownerId: actor.userId });
+    const project = await projectRepository.createProject({
+        name,
+        environment,
+        ownerId: actor.userId
+    });
+
+    // The new row can change both the owner's query results and every admin
+    // query. Version invalidation runs only after PostgreSQL commits.
+    await projectCache.invalidateProjectLists(actor.userId);
+    return project;
 };
 
 const updateProject = async (id, name, environment, actor) => {
@@ -189,9 +281,10 @@ const updateProject = async (id, name, environment, actor) => {
     }
 
     // PostgreSQL must succeed first because it is the source of truth. The
-    // cache service treats Redis DEL failures as non-fatal and the short TTL
+    // cache service treats Redis version-increment failures as non-fatal and the short TTL
     // still limits how long a stale value can remain.
     await projectCache.invalidateProject(projectId, existingProject.owner_id);
+    await projectCache.invalidateProjectLists(existingProject.owner_id);
     return project;
 };
 
@@ -203,6 +296,7 @@ const deleteProject = async (id, actor) => {
         throw new Apperror("Project not found", 404);
     }
     await projectCache.invalidateProject(projectId, existingProject.owner_id);
+    await projectCache.invalidateProjectLists(existingProject.owner_id);
 };
 
 module.exports = {

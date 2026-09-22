@@ -6,7 +6,9 @@ const redisConfig = require("../src/config/redis");
 const {
     connectRedis,
     createRedisClient,
-    getProjectCacheTtlSeconds
+    disconnectRedis,
+    getProjectCacheTtlSeconds,
+    getProjectCacheWriteTtlSeconds
 } = redisConfig;
 
 test("Redis is disabled when REDIS_URL is absent", () => {
@@ -94,6 +96,27 @@ test("project cache TTL defaults to 60 and accepts only positive integers", () =
     assert.equal(getProjectCacheTtlSeconds({ REDIS_PROJECT_TTL_SECONDS: "abc" }), 60);
 });
 
+test("cache write TTL adds configurable jitter without going below the base", () => {
+    const env = {
+        REDIS_PROJECT_TTL_SECONDS: "60",
+        REDIS_PROJECT_TTL_JITTER_SECONDS: "10"
+    };
+
+    assert.equal(getProjectCacheWriteTtlSeconds(env, () => 0), 60);
+    assert.equal(getProjectCacheWriteTtlSeconds(env, () => 0.999), 70);
+    assert.equal(getProjectCacheWriteTtlSeconds({
+        ...env,
+        REDIS_PROJECT_TTL_JITTER_SECONDS: "0"
+    }, () => 0.999), 60);
+});
+
+test("TTL jitter is bounded to one quarter of the base lifetime", () => {
+    assert.equal(getProjectCacheWriteTtlSeconds({
+        REDIS_PROJECT_TTL_SECONDS: "20",
+        REDIS_PROJECT_TTL_JITTER_SECONDS: "999"
+    }, () => 0.999), 25);
+});
+
 test("Redis operation timeout defaults to 500 milliseconds and validates overrides", () => {
     assert.equal(redisConfig.getRedisOperationTimeoutMs({}), 500);
     assert.equal(redisConfig.getRedisOperationTimeoutMs({ REDIS_OPERATION_TIMEOUT_MS: "250" }), 250);
@@ -126,6 +149,51 @@ test("connectRedis catches connection failures so Redis stays optional", async (
 
     assert.equal(await connectRedis(client, logger), false);
     assert.deepEqual(messages, [["Redis cache connection failed:", failure.message]]);
+});
+
+test("simultaneous startup calls share one Redis connection attempt", async () => {
+    let releaseConnection;
+    const gate = new Promise(resolve => { releaseConnection = resolve; });
+    let connectCalls = 0;
+    const client = {
+        isOpen: false,
+        connect: async () => {
+            connectCalls += 1;
+            // node-redis changes isOpen synchronously when connect() starts.
+            // Model that detail so the test catches ordering mistakes around
+            // the shared connection-attempt Promise.
+            client.isOpen = true;
+            await gate;
+        }
+    };
+
+    const first = connectRedis(client);
+    const second = connectRedis(client);
+    releaseConnection();
+
+    assert.deepEqual(await Promise.all([first, second]), [true, true]);
+    assert.equal(connectCalls, 1);
+});
+
+test("disconnectRedis closes an open optional client and handles cleanup errors", async () => {
+    let destroyed = 0;
+    const client = {
+        isOpen: true,
+        destroy: () => { destroyed += 1; }
+    };
+    assert.equal(await disconnectRedis(client), true);
+    assert.equal(destroyed, 1);
+    assert.equal(await disconnectRedis(null), false);
+    assert.equal(await disconnectRedis({ isOpen: false }), false);
+
+    const messages = [];
+    assert.equal(await disconnectRedis({
+        isOpen: true,
+        destroy: () => { throw new Error("cleanup failed"); }
+    }, {
+        warn: (...values) => messages.push(values)
+    }), false);
+    assert.deepEqual(messages, [["Redis cache disconnect failed:", "cleanup failed"]]);
 });
 
 test("timed-out clients are destroyed and replaced for future cache attempts", async () => {

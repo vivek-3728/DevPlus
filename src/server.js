@@ -10,7 +10,9 @@ const projectRoutes = require("./routes/projectRoutes"); // Routes for project A
 const authRoutes = require("./routes/authRoutes"); // Routes for registration and future authentication endpoints
 const errorHandler = require("./middleware/errorHandler"); // Middleware to handle application errors
 const { validateJwtConfig } = require("./config/auth"); // Validate required JWT environment configuration
-const { connectRedis } = require("./config/redis"); // Optional cache connection
+const { connectRedis, disconnectRedis } = require("./config/redis"); // Optional cache connection
+const { registerShutdownHandlers } = require("./services/serverLifecycle");
+const pool = require("./config/db");
 
 // Stop startup with a clear message when JWT_SECRET is missing or still uses the
 // public example value. Running without a private secret would break login and
@@ -50,7 +52,7 @@ app.get("/api/health", (req, res) => {
 app.use(errorHandler);
 
 // Start the Express server and listen for incoming connections on the specified PORT
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     // Log to console when the server starts successfully
     console.log(`DevPulse running on port ${PORT}`);
 });
@@ -59,8 +61,10 @@ app.listen(PORT, () => {
 // If Redis is absent, cache operations fail open and PostgreSQL serves reads.
 connectRedis();
 
-// CommonJS caches this module, so repositories and this check share one pool.
-const pool = require("./config/db");
+// Close network/database resources on the normal container/terminal shutdown
+// signals. The helper deduplicates simultaneous signals and Redis remains
+// optional even during cleanup.
+registerShutdownHandlers({ server, pool, disconnectRedis });
 
 // This asynchronous database check runs after starting the HTTP listener.
 // A failure is logged; it does not stop the server or change /api/health.

@@ -1,3 +1,5 @@
+// Services throw this error for expected client problems, such as invalid input.
+// The central handler reads statusCode and isOperational to build the HTTP response.
 // Custom Error class that extends the built-in Error class
 class Apperror extends Error {
   // Constructor that accepts error message and HTTP status code
@@ -10,6 +12,7 @@ class Apperror extends Error {
     this.isOperational = true;
     // Capture the stack trace for debugging purposes
     Error.captureStackTrace(this, this.constructor);
+    // Omitting this constructor from the stack makes the throwing call easier to find.
   }
 }
 

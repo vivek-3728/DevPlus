@@ -41,6 +41,8 @@ const owned = {
     environment: "development",
     owner_id: 31
 };
+const projectCacheKey = "devpulse:project:user:31:v0:7";
+const cacheContext = (value, cacheKey = projectCacheKey) => ({ value, cacheKey });
 
 const withTestDeadline = (promise, milliseconds = 100) => Promise.race([
     promise,
@@ -52,7 +54,7 @@ const withTestDeadline = (promise, milliseconds = 100) => Promise.race([
 test("cache miss queries PostgreSQL and caches only the authorized project", async () => {
     const writes = [];
     let databaseReads = 0;
-    projectCache.getProject = async () => undefined;
+    projectCache.getProject = async () => cacheContext(undefined);
     projectRepository.getProjectById = async () => {
         databaseReads += 1;
         return owned;
@@ -64,12 +66,96 @@ test("cache miss queries PostgreSQL and caches only the authorized project", asy
 
     assert.deepEqual(await projectService.getProjectById("7", user), owned);
     assert.equal(databaseReads, 1);
-    assert.deepEqual(writes, [[owned, user]]);
+    assert.deepEqual(writes, [[projectCacheKey, owned]]);
+});
+
+test("concurrent identical project misses share one PostgreSQL load", async () => {
+    let releaseDatabase;
+    const gate = new Promise(resolve => { releaseDatabase = resolve; });
+    let databaseReads = 0;
+    let cacheWrites = 0;
+    projectCache.getProject = async () => ({
+        value: undefined,
+        cacheKey: "devpulse:project:user:31:v0:7"
+    });
+    projectRepository.getProjectById = async () => {
+        databaseReads += 1;
+        await gate;
+        return owned;
+    };
+    projectCache.setProject = async () => { cacheWrites += 1; return true; };
+
+    const first = projectService.getProjectById("7", user);
+    const second = projectService.getProjectById("7", user);
+    releaseDatabase();
+
+    assert.deepEqual(await Promise.all([first, second]), [owned, owned]);
+    assert.equal(databaseReads, 1);
+    assert.equal(cacheWrites, 1);
+});
+
+test("a read started after update invalidation does not join an older version flight", async () => {
+    let releaseOldRead;
+    let markOldReadStarted;
+    const oldReadGate = new Promise(resolve => { releaseOldRead = resolve; });
+    const oldReadStarted = new Promise(resolve => { markOldReadStarted = resolve; });
+    const freshProject = { ...owned, name: "Fresh" };
+    let version = 0;
+    let databaseReads = 0;
+
+    projectCache.getProject = async () => ({
+        value: undefined,
+        cacheKey: `devpulse:project:user:31:v${version}:7`
+    });
+    projectCache.setProject = async () => true;
+    projectCache.invalidateProjectLists = async () => true;
+    projectCache.invalidateProject = async () => { version += 1; return true; };
+    projectRepository.getProjectById = async () => {
+        databaseReads += 1;
+        if (databaseReads === 1) {
+            markOldReadStarted();
+            await oldReadGate;
+            return owned;
+        }
+        if (databaseReads === 2) return owned; // update authorization read
+        return freshProject;
+    };
+    projectRepository.updateProject = async () => freshProject;
+
+    const oldRead = projectService.getProjectById("7", user);
+    await oldReadStarted;
+    await projectService.updateProject("7", "Fresh", "development", user);
+
+    // This read starts after the update and its version invalidation completed.
+    // It must not share the still-running load that used version 0.
+    const newRead = projectService.getProjectById("7", user);
+    releaseOldRead();
+
+    assert.deepEqual(await oldRead, owned);
+    assert.deepEqual(await newRead, freshProject);
+    assert.equal(databaseReads, 3);
+});
+
+test("individual cache hits strip unexpected authentication fields", async () => {
+    projectCache.getProject = async () => ({
+        value: {
+            ...owned,
+            password_hash: "never return",
+            token: "never return",
+            email: "never return"
+        },
+        cacheKey: "devpulse:project:user:31:v0:7"
+    });
+    projectRepository.getProjectById = async () => {
+        assert.fail("a valid cache hit must not query PostgreSQL");
+    };
+
+    assert.deepEqual(await projectService.getProjectById("7", user), owned);
 });
 
 test("valid cache hit returns the project without querying PostgreSQL", async () => {
     let cacheWrites = 0;
-    projectCache.getProject = async () => owned;
+    projectCache.getProject = async () => cacheContext(owned);
     projectCache.setProject = async () => { cacheWrites += 1; };
     projectRepository.getProjectById = async () => {
         assert.fail("PostgreSQL must not be queried on a valid cache hit");
@@ -84,7 +170,7 @@ test("wrong project ID in cache falls back to PostgreSQL", async () => {
     let databaseReads = 0;
     projectCache.getProject = async () => {
         cacheReads += 1;
-        return { ...owned, id: 8 };
+        return cacheContext({ ...owned, id: 8 });
     };
     projectRepository.getProjectById = async () => {
         databaseReads += 1;
@@ -102,7 +188,7 @@ test("incomplete cached project data falls back to PostgreSQL", async () => {
     let databaseReads = 0;
     projectCache.getProject = async () => {
         cacheReads += 1;
-        return { id: 7, owner_id: 31 };
+        return cacheContext({ id: 7, owner_id: 31 });
     };
     projectRepository.getProjectById = async () => {
         databaseReads += 1;
@@ -121,7 +207,7 @@ for (const cachedOwner of [44, null]) {
         let cacheWrites = 0;
         projectCache.getProject = async () => {
             cacheReads += 1;
-            return { ...owned, owner_id: cachedOwner };
+            return cacheContext({ ...owned, owner_id: cachedOwner });
         };
         projectRepository.getProjectById = async () => ({ ...owned, owner_id: cachedOwner });
         projectCache.setProject = async () => { cacheWrites += 1; };
@@ -142,10 +228,16 @@ test("administrator cache hits retain access to owned and legacy projects", asyn
         return undefined;
     };
 
-    projectCache.getProject = async () => ({ ...owned, owner_id: 44 });
+    projectCache.getProject = async () => cacheContext(
+        { ...owned, owner_id: 44 },
+        "devpulse:project:admin:v0:7"
+    );
     assert.equal((await projectService.getProjectById("7", admin)).owner_id, 44);
 
-    projectCache.getProject = async () => ({ ...owned, owner_id: null });
+    projectCache.getProject = async () => cacheContext(
+        { ...owned, owner_id: null },
+        "devpulse:project:admin:v0:7"
+    );
     assert.equal((await projectService.getProjectById("7", admin)).owner_id, null);
     assert.equal(databaseReads, 0);
 });
@@ -153,7 +245,10 @@ test("administrator cache hits retain access to owned and legacy projects", asyn
 test("404 and PostgreSQL errors are not cached", async () => {
     let cacheReads = 0;
     let cacheWrites = 0;
-    projectCache.getProject = async () => { cacheReads += 1; return undefined; };
+    projectCache.getProject = async () => {
+        cacheReads += 1;
+        return cacheContext(undefined);
+    };
     projectCache.setProject = async () => { cacheWrites += 1; };
     projectRepository.getProjectById = async () => undefined;
 
@@ -188,7 +283,10 @@ test("invalid IDs are rejected before cache or PostgreSQL access", async () => {
 
 test("Redis miss or failed cache population still returns PostgreSQL data", async () => {
     let cacheReads = 0;
-    projectCache.getProject = async () => { cacheReads += 1; return undefined; };
+    projectCache.getProject = async () => {
+        cacheReads += 1;
+        return cacheContext(undefined);
+    };
     projectRepository.getProjectById = async () => owned;
     projectCache.setProject = async () => false;
 
@@ -363,13 +461,16 @@ test("cache invalidation failure does not change successful database responses",
     await assert.doesNotReject(projectService.deleteProject("7", user));
 });
 
-test("a Redis DEL that stops responding does not block a successful update", async () => {
+test("a Redis version invalidation that stops responding does not block an update", async () => {
     console.warn = () => {};
     const updated = { ...owned, name: "Updated", environment: "production" };
     let recycledClients = 0;
     redisConfig.redisClient = {
         isReady: true,
-        del: async () => new Promise(() => {}),
+        multi: () => ({
+            incr() { return this; },
+            exec: async () => new Promise(() => {})
+        }),
         destroy: () => {}
     };
     redisConfig.getRedisOperationTimeoutMs = () => 10;

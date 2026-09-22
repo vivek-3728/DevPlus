@@ -3,7 +3,9 @@ require("dotenv").config();
 const { createClient: createNodeRedisClient } = require("redis");
 
 const DEFAULT_PROJECT_CACHE_TTL_SECONDS = 60;
+const DEFAULT_PROJECT_CACHE_TTL_JITTER_SECONDS = 10;
 const DEFAULT_REDIS_OPERATION_TIMEOUT_MS = 500;
+const connectionAttempts = new WeakMap();
 
 const readPositiveInteger = (value, defaultValue) => {
     if (!/^\d+$/.test(value ?? "")) return defaultValue;
@@ -18,6 +20,36 @@ const getProjectCacheTtlSeconds = (env = process.env) => {
         env.REDIS_PROJECT_TTL_SECONDS,
         DEFAULT_PROJECT_CACHE_TTL_SECONDS
     );
+};
+
+const readNonNegativeInteger = (value, defaultValue) => {
+    if (!/^\d+$/.test(value ?? "")) return defaultValue;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? parsed : defaultValue;
+};
+
+// Adding a small random amount spreads expiration times across several
+// seconds. This reduces the chance that many popular keys expire together and
+// all send PostgreSQL queries at the same moment.
+const getProjectCacheWriteTtlSeconds = (
+    env = process.env,
+    random = Math.random
+) => {
+    const baseTtl = getProjectCacheTtlSeconds(env);
+    const configuredJitter = readNonNegativeInteger(
+        env.REDIS_PROJECT_TTL_JITTER_SECONDS,
+        DEFAULT_PROJECT_CACHE_TTL_JITTER_SECONDS
+    );
+
+    // Jitter is capped at 25% of the base TTL. A configuration mistake cannot
+    // silently turn a short cache lifetime into a very long one.
+    const boundedJitter = Math.min(configuredJitter, Math.floor(baseTtl / 4));
+    const sample = Math.min(1, Math.max(0, Number(random()) || 0));
+    const addedSeconds = Math.min(
+        boundedJitter,
+        Math.floor(sample * (boundedJitter + 1))
+    );
+    return baseTtl + addedSeconds;
 };
 
 // Cache operations have a short deadline so an unresponsive Redis connection
@@ -66,14 +98,49 @@ const createRedisClient = ({
 const redisClient = createRedisClient();
 
 const connectRedis = async (client = module.exports.redisClient, logger = console) => {
-    if (!client || client.isOpen) return false;
+    if (!client) return false;
+
+    // Startup and timeout recovery can ask for a connection simultaneously.
+    // Reusing the same Promise prevents duplicate connect() calls on one client.
+    const existingAttempt = connectionAttempts.get(client);
+    if (existingAttempt) return existingAttempt;
+    if (client.isOpen) return false;
+
+    const attempt = (async () => {
+        try {
+            await client.connect();
+            return true;
+        } catch (error) {
+            // Redis improves performance but is not required for correctness.
+            logger.error("Redis cache connection failed:", error.message);
+            return false;
+        }
+    })();
+    connectionAttempts.set(client, attempt);
 
     try {
-        await client.connect();
+        return await attempt;
+    } finally {
+        if (connectionAttempts.get(client) === attempt) {
+            connectionAttempts.delete(client);
+        }
+    }
+};
+
+const disconnectRedis = async (
+    client = module.exports.redisClient,
+    logger = console
+) => {
+    if (!client?.isOpen) return false;
+
+    try {
+        // Cached data is disposable, so destroy() is appropriate during
+        // shutdown: it closes promptly and rejects commands still waiting.
+        client.destroy();
+        connectionAttempts.delete(client);
         return true;
     } catch (error) {
-        // Redis improves performance but is not required for correctness.
-        logger.error("Redis cache connection failed:", error.message);
+        logger.warn("Redis cache disconnect failed:", error.message);
         return false;
     }
 };
@@ -104,8 +171,10 @@ const recycleRedisClient = (failedClient, {
 module.exports = {
     redisClient,
     connectRedis,
+    disconnectRedis,
     createRedisClient,
     recycleRedisClient,
     getProjectCacheTtlSeconds,
+    getProjectCacheWriteTtlSeconds,
     getRedisOperationTimeoutMs
 };

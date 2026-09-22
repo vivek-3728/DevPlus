@@ -206,10 +206,10 @@ CRUD behavior. Live database integration must be checked separately once access
 works; no schema migration or real project deletion is performed by these tests.
 
 NOT IMPLEMENTED
-Authentication, authorization, pagination/search, caching, rate limiting,
-explicit CORS configuration, migrations, explicit multi-query transactions,
-file uploads, background jobs, and deployment configuration are not implemented.
-Any database constraints outside the source repository remain unverified.
+Rate limiting, Redis sessions, queues, Pub/Sub, explicit CORS configuration,
+file uploads, background jobs, Docker and deployment configuration are not
+implemented yet. Authentication, authorization, pagination/search, migrations,
+transactions and Redis project caching are implemented in the current phases.
 
 POSTGRESQL TRANSACTIONS
 - BEGIN starts one all-or-nothing unit of database work.
@@ -240,13 +240,42 @@ CACHE-ASIDE WITH REDIS
   placed in Redis for the configured TTL (time to live).
 - Cache keys include the authenticated user or administrator scope. The service
   still checks the cached project's ID and ownership before returning it.
-- Successful updates and deletes invalidate the administrator key and the
-  owner's key only after PostgreSQL succeeds.
+- Individual-project keys include a shared per-project version. Successful
+  updates and deletes increment that version only after PostgreSQL succeeds,
+  making both owner and administrator entries from the old version unreachable.
 - Redis failures fall back to PostgreSQL. If invalidation fails, a stale entry
   can remain until its TTL expires; this is the availability trade-off of using
   Redis as an optional optimization.
 - Redis operations also have a short deadline. If a connected server stops
   responding, DevPulse replaces that client and continues with PostgreSQL.
-- Caching saves repeated database reads, but serialization, network calls, and
-  invalidation add complexity. The paginated/search list is intentionally not
-  cached because its many query combinations would be harder to invalidate.
+- Project-list cache keys contain the normalized page, limit, environment,
+  search, sort and order values. They also contain either the authenticated
+  user ID or a separate administrator scope, so different visibility rules do
+  not share cached responses.
+- List invalidation uses small namespace-version keys. After a successful
+  create, update or delete, Redis increments the affected owner's version and
+  the administrator version. Future reads use the new version in their cache
+  key; old query combinations become unreachable and expire through TTL.
+- Versioning avoids KEYS * and wildcard scans, which can block a busy Redis
+  server. It also means invalidation cost stays small even when many different
+  page/search/sort combinations have been cached.
+- A small random TTL addition spreads key expirations over several seconds.
+  This reduces the chance that many simultaneous expirations send a burst of
+  identical work to PostgreSQL.
+- In-process single-flight protection lets concurrent requests for the same
+  actor-scoped, versioned resource share one database load. Including the
+  version is important: a request that starts after invalidation must not join
+  an older namespace's work. This is deliberately not a distributed lock:
+  multiple Node.js processes can each perform one load, while correctness still
+  comes from PostgreSQL and versioned cache keys.
+- The exact versioned key from a cache miss is reused for cache population. If
+  an update invalidates during that database read, the older result can only be
+  written into the old namespace. A request that already read an old cache hit
+  can still finish during a concurrent update; fully eliminating that narrow
+  window would require stronger coordination than this optional cache needs.
+- Redis startup attempts are deduplicated. Normal SIGINT/SIGTERM shutdown closes
+  the HTTP server, destroys the optional Redis connection, and ends the
+  PostgreSQL pool once.
+- Caching saves repeated database reads, but serialization, network calls and
+  invalidation add complexity. A Redis failure can leave an old entry stored,
+  but PostgreSQL still serves requests and TTL limits how long it remains.
