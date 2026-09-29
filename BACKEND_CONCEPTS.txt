@@ -279,3 +279,80 @@ CACHE-ASIDE WITH REDIS
 - Caching saves repeated database reads, but serialization, network calls and
   invalidation add complexity. A Redis failure can leave an old entry stored,
   but PostgreSQL still serves requests and TTL limits how long it remains.
+
+API SECURITY AND HARDENING
+- Helmet adds maintained browser security headers to every response. DevPulse
+  uses its production-safe defaults; these headers protect the API response and
+  do not prevent an explicitly allowed React frontend from using CORS fetches.
+- CORS_ALLOWED_ORIGINS is a comma-separated allow-list. Development defaults to
+  http://localhost:5173 when the setting is absent. Production defaults closed,
+  rejects wildcard configuration, and still permits requests without an Origin
+  header because command-line and server-to-server clients are not browsers.
+- JSON and URL-encoded request bodies default to a 100kb maximum. Oversized
+  bodies stop before controllers and receive HTTP 413 with a safe JSON message.
+- The general API policy allows 100 requests per 15 minutes per client IP.
+  Login and registration share a stricter 10-attempt, 15-minute policy. Limits
+  are configurable through environment variables and violations return 429.
+  CORS-denied and malformed authentication traffic also consumes its relevant
+  allowance rather than bypassing the limiter.
+- Rate-limit counters intentionally use express-rate-limit's in-memory store.
+  Redis remains optional caching infrastructure, so a Redis outage cannot make
+  PostgreSQL-backed endpoints unavailable. The trade-off is that counters reset
+  on restart and are separate in each Node.js process. Before multi-instance
+  deployment, use a dedicated shared rate-limit store with an explicit failure
+  policy; do not silently make the optional cache a required dependency.
+- Expected AppError status codes and messages remain visible to clients.
+  Unexpected errors return only Internal Server Error. Production diagnostics
+  log safe classification fields rather than raw driver errors, and development
+  diagnostics redact common JWT, password, database and Redis credential forms.
+- Rate limiting uses the direct socket address by default. Deployments behind a
+  reverse proxy must set TRUST_PROXY_HOPS to the exact positive hop count. This
+  avoids treating every proxied user as one client without trusting arbitrary
+  spoofed X-Forwarded-For headers. Request logs omit query strings entirely.
+- Helmet, CORS, general limiting, parsers and the stricter authentication limit
+  are assembled in src/app.js. Both server entry points now use that same tested
+  middleware order, which avoids one entry point accidentally missing a guard.
+
+STRUCTURED LOGGING AND REQUEST IDS
+- Each log entry is one JSON object on one line. Stable fields such as timestamp,
+  level and event make logs easier for people to read and for log systems to
+  search than free-form console text.
+- The first application middleware generates a server-owned UUID for every
+  request, stores it on req.requestId, and returns it in X-Request-ID. DevPulse
+  deliberately ignores arbitrary incoming IDs until a trusted proxy boundary is
+  configured, preventing an attacker from forging or injecting correlation data.
+- AsyncLocalStorage carries the request ID through asynchronous controller,
+  service and repository work. The structured logger can therefore include the
+  same requestId without adding another argument to every function.
+- Request completion logs contain method, path, status and durationMs. They use
+  req.path instead of req.url, so query-string credentials or search terms are
+  never copied into logs. Bodies and request headers are not logged.
+- Normal responses log at info, 4xx responses at warn and 5xx responses at
+  error. Expected operational AppErrors are warnings; unexpected failures are
+  error events with a redacted development stack and a safe production
+  classification. Client responses never receive the stack.
+- The logger recursively redacts password, hash, token, Authorization, cookie,
+  JWT-secret, database-URL and Redis-URL fields. Common secret formats inside
+  free-form strings are also redacted. Callers should still pass the smallest
+  useful diagnostic fields rather than treating redaction as permission to log
+  full request objects or environment configuration.
+
+RELIABILITY AND HEALTH PROBES
+- GET /health is a liveness probe. It performs no dependency calls: a 200
+  {"status":"alive"} means only that this Node.js process can answer HTTP.
+- GET /ready is a readiness probe. It runs a small, time-bounded SELECT 1
+  against PostgreSQL because PostgreSQL is the source of truth required for
+  normal traffic. It returns 503 with a safe body when that check fails.
+- Redis is deliberately absent from readiness. Redis is an optional cache, so
+  an outage may reduce performance but must not remove an otherwise usable API
+  instance from service. Probe requests are excluded from application rate
+  limits so frequent infrastructure checks do not create false failures.
+- Startup requires NODE_ENV, all PostgreSQL connection settings, and a private
+  JWT_SECRET. PORT, JWT duration, CORS, body limits, rate limits, proxy hops,
+  readiness timeout, and shutdown timeout have safe defaults but are validated
+  when supplied. Redis URL and cache tuning remain optional.
+- SIGINT/SIGTERM reuse one shutdown Promise. The HTTP server first stops
+  accepting connections, idle sockets close, and active responses receive a
+  configurable grace period. Remaining sockets are force-closed after the
+  deadline; Redis then closes and the PostgreSQL pool ends. Structured events
+  record the start, timeout if any, HTTP closure, cleanup problems, and finish.

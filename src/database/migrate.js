@@ -1,5 +1,6 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const { getErrorLogMessage } = require("../utils/errorDiagnostics");
 const defaultPool = require("../config/db");
 
 // PostgreSQL advisory locks are application-defined locks identified by a
@@ -109,7 +110,7 @@ const runFromCommandLine = async () => {
         }
         console.log(`Migration complete: ${result.applied.length} applied, ${result.skipped.length} skipped.`);
     } catch (error) {
-        console.error(error.message);
+        console.error(getErrorLogMessage(error));
         process.exitCode = 1;
     } finally {
         await defaultPool.end();

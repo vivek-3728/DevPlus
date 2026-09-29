@@ -27,7 +27,7 @@ test("Redis client uses environment configuration and handles lifecycle events",
     const messages = [];
     let options;
     const logger = {
-        log: (...values) => messages.push(values),
+        info: (...values) => messages.push(values),
         warn: (...values) => messages.push(values),
         error: (...values) => messages.push(values)
     };
@@ -51,17 +51,17 @@ test("Redis client uses environment configuration and handles lifecycle events",
     fakeClient.emit("reconnecting");
     fakeClient.emit("end");
     assert.deepEqual(messages, [
-        ["Redis cache error:", "offline"],
-        ["Redis cache ready"],
-        ["Redis cache reconnecting"],
-        ["Redis cache connection closed"]
+        ["redis.error", { message: "offline" }],
+        ["redis.ready"],
+        ["redis.reconnecting"],
+        ["redis.connection_closed"]
     ]);
 });
 
 test("invalid Redis configuration disables the optional cache instead of crashing", () => {
     const messages = [];
     const logger = {
-        log() {},
+        info() {},
         warn() {},
         error: (...values) => messages.push(values)
     };
@@ -73,12 +73,12 @@ test("invalid Redis configuration disables the optional cache instead of crashin
         }), null);
     });
     assert.equal(messages.length, 1);
-    assert.equal(messages[0][0], "Redis cache configuration failed:");
+    assert.equal(messages[0][0], "redis.configuration_failed");
     assert.equal(messages.flat().join(" ").includes("secret"), false);
 });
 
 test("a throwing Redis client factory is handled as optional infrastructure", () => {
-    const logger = { log() {}, warn() {}, error() {} };
+    const logger = { info() {}, warn() {}, error() {} };
     const client = createRedisClient({
         env: { REDIS_URL: "redis://localhost:6379" },
         createClient: () => { throw new Error("invalid configuration"); },
@@ -140,6 +140,8 @@ test("connectRedis catches connection failures so Redis stays optional", async (
     const failure = new Error("connection refused");
     const messages = [];
     const logger = {
+        info() {},
+        warn() {},
         error: (...values) => messages.push(values)
     };
     const client = {
@@ -148,7 +150,7 @@ test("connectRedis catches connection failures so Redis stays optional", async (
     };
 
     assert.equal(await connectRedis(client, logger), false);
-    assert.deepEqual(messages, [["Redis cache connection failed:", failure.message]]);
+    assert.deepEqual(messages, [["redis.connection_failed", { message: failure.message }]]);
 });
 
 test("simultaneous startup calls share one Redis connection attempt", async () => {
@@ -176,13 +178,13 @@ test("simultaneous startup calls share one Redis connection attempt", async () =
 });
 
 test("disconnectRedis closes an open optional client and handles cleanup errors", async () => {
-    let destroyed = 0;
+    let closed = 0;
     const client = {
         isOpen: true,
-        destroy: () => { destroyed += 1; }
+        close: async () => { closed += 1; }
     };
     assert.equal(await disconnectRedis(client), true);
-    assert.equal(destroyed, 1);
+    assert.equal(closed, 1);
     assert.equal(await disconnectRedis(null), false);
     assert.equal(await disconnectRedis({ isOpen: false }), false);
 
@@ -191,9 +193,10 @@ test("disconnectRedis closes an open optional client and handles cleanup errors"
         isOpen: true,
         destroy: () => { throw new Error("cleanup failed"); }
     }, {
+        info() {},
         warn: (...values) => messages.push(values)
     }), false);
-    assert.deepEqual(messages, [["Redis cache disconnect failed:", "cleanup failed"]]);
+    assert.deepEqual(messages, [["redis.disconnect_failed", { message: "cleanup failed" }]]);
 });
 
 test("timed-out clients are destroyed and replaced for future cache attempts", async () => {
@@ -203,7 +206,7 @@ test("timed-out clients are destroyed and replaced for future cache attempts", a
     const replacementClient = new EventEmitter();
     replacementClient.isOpen = false;
     replacementClient.connect = async () => { connected += 1; };
-    const logger = { log() {}, warn() {}, error() {} };
+    const logger = { info() {}, warn() {}, error() {} };
     const originalClient = redisConfig.redisClient;
     redisConfig.redisClient = failedClient;
 

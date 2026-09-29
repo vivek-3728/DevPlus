@@ -1,4 +1,6 @@
 const redisConfig = require("../config/redis");
+const { getErrorLogMessage } = require("../utils/errorDiagnostics");
+const { logger } = require("../utils/structuredLogger");
 
 // Cache keys include the authorization scope. A normal user's verified JWT ID
 // becomes part of the key, while administrators use a separate namespace.
@@ -115,7 +117,9 @@ const getProject = async (projectId, actor) => {
     } catch (error) {
         // A cache read failure is the same as a cache miss. The project service
         // will continue to PostgreSQL, which remains the source of truth.
-        console.warn("Redis project cache read failed:", error.message);
+        logger.warn("redis.project_cache_read_failed", {
+            message: getErrorLogMessage(error)
+        });
         return undefined;
     }
 };
@@ -139,7 +143,9 @@ const setProject = async (cacheKey, project) => {
     } catch (error) {
         // Returning false keeps Redis failures local to this optional layer.
         // PostgreSQL errors are handled elsewhere and are never swallowed here.
-        console.warn("Redis project cache write failed:", error.message);
+        logger.warn("redis.project_cache_write_failed", {
+            message: getErrorLogMessage(error)
+        });
         return false;
     }
 };
@@ -161,7 +167,9 @@ const invalidateProject = async (projectId, ownerId) => {
     } catch (error) {
         // The database mutation has already succeeded. A failed version bump must not
         // turn that successful source-of-truth write into an HTTP error.
-        console.warn("Redis project cache invalidation failed:", error.message);
+        logger.warn("redis.project_cache_invalidation_failed", {
+            message: getErrorLogMessage(error)
+        });
         return false;
     }
 };
@@ -191,7 +199,9 @@ const getProjectList = async (query, actor) => {
             cacheKey
         };
     } catch (error) {
-        console.warn("Redis project list cache read failed:", error.message);
+        logger.warn("redis.project_list_cache_read_failed", {
+            message: getErrorLogMessage(error)
+        });
         return undefined;
     }
 };
@@ -217,7 +227,9 @@ const setProjectList = async (cacheKey, query, response) => {
         );
         return true;
     } catch (error) {
-        console.warn("Redis project list cache write failed:", error.message);
+        logger.warn("redis.project_list_cache_write_failed", {
+            message: getErrorLogMessage(error)
+        });
         return false;
     }
 };
@@ -241,7 +253,9 @@ const invalidateProjectLists = async (ownerId) => {
     } catch (error) {
         // PostgreSQL has already succeeded when mutations call this helper.
         // Redis remains optional, and TTL bounds staleness after a failure.
-        console.warn("Redis project list cache invalidation failed:", error.message);
+        logger.warn("redis.project_list_cache_invalidation_failed", {
+            message: getErrorLogMessage(error)
+        });
         return false;
     }
 };

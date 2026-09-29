@@ -29,3 +29,12 @@ test("JWT configuration uses a supplied token expiration", () => {
     process.env.JWT_EXPIRES_IN = "15m";
     assert.equal(authConfig.getJwtExpiresIn(), "15m");
 });
+
+test("JWT configuration rejects an invalid supplied expiration", () => {
+    process.env.JWT_SECRET = "private-test-secret";
+    process.env.JWT_EXPIRES_IN = "forever";
+    assert.throws(
+        () => authConfig.validateJwtConfig(),
+        /JWT_EXPIRES_IN must be a positive duration/
+    );
+});

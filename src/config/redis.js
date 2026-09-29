@@ -1,6 +1,8 @@
-require("dotenv").config();
+require("dotenv").config({ quiet: true });
 
 const { createClient: createNodeRedisClient } = require("redis");
+const { getErrorLogMessage } = require("../utils/errorDiagnostics");
+const { logger: applicationLogger } = require("../utils/structuredLogger");
 
 const DEFAULT_PROJECT_CACHE_TTL_SECONDS = 60;
 const DEFAULT_PROJECT_CACHE_TTL_JITTER_SECONDS = 10;
@@ -62,7 +64,7 @@ const getRedisOperationTimeoutMs = (env = process.env) => readPositiveInteger(
 const createRedisClient = ({
     env = process.env,
     createClient = createNodeRedisClient,
-    logger = console
+    logger = applicationLogger
 } = {}) => {
     const url = env.REDIS_URL?.trim();
 
@@ -78,26 +80,31 @@ const createRedisClient = ({
             disableOfflineQueue: true
         });
 
-        client.on("ready", () => logger.log("Redis cache ready"));
-        client.on("reconnecting", () => logger.warn("Redis cache reconnecting"));
-        client.on("end", () => logger.warn("Redis cache connection closed"));
+        client.on("ready", () => logger.info("redis.ready"));
+        client.on("reconnecting", () => logger.warn("redis.reconnecting"));
+        client.on("end", () => logger.warn("redis.connection_closed"));
 
         // Node.js EventEmitters throw unhandled "error" events. Registering this
         // listener keeps a Redis outage from terminating the API process.
-        client.on("error", (error) => logger.error("Redis cache error:", error.message));
+        client.on("error", (error) => logger.error("redis.error", {
+            message: getErrorLogMessage(error)
+        }));
         return client;
     } catch {
         // URL parsing happens while createClient() runs and can throw before
         // connect(). Keep the diagnostic generic so credentials in REDIS_URL
         // are never copied into logs.
-        logger.error("Redis cache configuration failed:");
+        logger.error("redis.configuration_failed");
         return null;
     }
 };
 
 const redisClient = createRedisClient();
 
-const connectRedis = async (client = module.exports.redisClient, logger = console) => {
+const connectRedis = async (
+    client = module.exports.redisClient,
+    logger = applicationLogger
+) => {
     if (!client) return false;
 
     // Startup and timeout recovery can ask for a connection simultaneously.
@@ -112,7 +119,9 @@ const connectRedis = async (client = module.exports.redisClient, logger = consol
             return true;
         } catch (error) {
             // Redis improves performance but is not required for correctness.
-            logger.error("Redis cache connection failed:", error.message);
+            logger.error("redis.connection_failed", {
+                message: getErrorLogMessage(error)
+            });
             return false;
         }
     })();
@@ -129,18 +138,21 @@ const connectRedis = async (client = module.exports.redisClient, logger = consol
 
 const disconnectRedis = async (
     client = module.exports.redisClient,
-    logger = console
+    logger = applicationLogger
 ) => {
     if (!client?.isOpen) return false;
 
     try {
-        // Cached data is disposable, so destroy() is appropriate during
-        // shutdown: it closes promptly and rejects commands still waiting.
-        client.destroy();
+        // close() lets commands already accepted by node-redis finish before
+        // the socket closes. Older/test clients fall back to destroy().
+        if (typeof client.close === "function") await client.close();
+        else client.destroy();
         connectionAttempts.delete(client);
         return true;
     } catch (error) {
-        logger.warn("Redis cache disconnect failed:", error.message);
+        logger.warn("redis.disconnect_failed", {
+            message: getErrorLogMessage(error)
+        });
         return false;
     }
 };
@@ -148,7 +160,7 @@ const disconnectRedis = async (
 const recycleRedisClient = (failedClient, {
     env = process.env,
     createClient = createNodeRedisClient,
-    logger = console
+    logger = applicationLogger
 } = {}) => {
     // Multiple requests can time out together. Only the first one that still
     // owns the shared client should destroy and replace it.
@@ -159,7 +171,7 @@ const recycleRedisClient = (failedClient, {
         // preventing timed-out Promises from accumulating in memory.
         failedClient.destroy();
     } catch {
-        logger.warn("Redis cache client cleanup failed");
+        logger.warn("redis.client_cleanup_failed");
     }
 
     const replacement = createRedisClient({ env, createClient, logger });

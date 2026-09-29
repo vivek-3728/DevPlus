@@ -1,37 +1,50 @@
-// The import below is currently unused: the handler checks err.isOperational,
-// rather than using instanceof Apperror to check the error's class.
-// Import the Apperror class for checking if error is operational
-const Apperror = require("../errors/Apperror");
+const { getErrorLogDetails, redactSensitiveText } = require("../utils/errorDiagnostics");
+const { logger: defaultLogger } = require("../utils/structuredLogger");
 
-// Define error handler middleware with 4 parameters (Express identifies this as error handler by parameter count)
-const errorHandler = (err, req, res, next) => {
-    // Keep all four parameters: Express uses this signature to recognize error middleware.
-    // next(error), thrown errors, and rejected async handlers can arrive here.
-    // Log the error to the console for debugging and monitoring purposes
-    console.error(err);
-
-    // Return a proper client error when JSON request parsing fails
+const classifyError = (err) => {
+    if (err.type === "entity.too.large" || err.status === 413) {
+        return { status: 413, message: "Request body is too large", operational: true };
+    }
     if (err.type === "entity.parse.failed") {
-        // return stops execution so the handler cannot send a second response below.
-        return res.status(400).json({
-            error: "Invalid JSON payload"
-        });
+        return { status: 400, message: "Invalid JSON payload", operational: true };
     }
-
-    // Check if this is one of our custom operational errors with proper status codes
     if (err.isOperational) {
-        // If it's an operational error, send the response with the stored status code and message
-        return res.status(err.statusCode).json({
-            error: err.message
-        });
+        return { status: err.statusCode, message: err.message, operational: true };
     }
-
-    // Internal details stay in console.error above instead of being sent to the client.
-    // For any unexpected errors that are not operational, send a generic 500 error response
-    res.status(500).json({
-        error: "Internal Server Error"
-    });
+    return { status: 500, message: "Internal Server Error", operational: false };
 };
 
-// Export the errorHandler middleware function so it can be used in other modules
-module.exports = errorHandler;   
+const createErrorHandler = ({ logger = defaultLogger, env = process.env } = {}) => {
+    return (err, req, res, next) => {
+        const classification = classifyError(err);
+        const details = getErrorLogDetails(err, env);
+        const fields = {
+            method: req.method,
+            path: req.path,
+            status: classification.status,
+            operational: classification.operational,
+            errorType: details.name || "Error"
+        };
+
+        if (classification.operational) {
+            // Expected client/application failures are warnings, not crashes.
+            fields.message = redactSensitiveText(classification.message);
+            logger.warn("http.request.error", fields);
+        } else {
+            // Development keeps a redacted stack. Production retains only safe
+            // classifications, preserving the production-safe error contract.
+            if (env.NODE_ENV !== "production") {
+                fields.message = redactSensitiveText(err.message || "Unexpected error");
+                fields.stack = typeof details === "string" ? details : undefined;
+            }
+            if (details.code) fields.errorCode = details.code;
+            logger.error("http.request.error", fields);
+        }
+
+        res.status(classification.status).json({ error: classification.message });
+    };
+};
+
+module.exports = createErrorHandler();
+module.exports.createErrorHandler = createErrorHandler;
+module.exports.classifyError = classifyError;

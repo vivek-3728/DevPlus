@@ -1,13 +1,10 @@
-require("dotenv").config();
+// Keep dotenv's startup banner out of stdout so application logs remain valid
+// one-JSON-object-per-line output for production log collectors.
+require("dotenv").config({ quiet: true });
 
 const { Pool } = require("pg");
+const { getDatabaseConfig } = require("./database");
 
-const pool = new Pool({
-    user: process.env.DB_USER,
-    host: process.env.DB_HOST,
-    database: process.env.DB_NAME,
-    password: process.env.DB_PASSWORD,
-    port: Number(process.env.DB_PORT)
-});
+const pool = new Pool(getDatabaseConfig(process.env));
 
-module.exports = pool;  
+module.exports = pool;

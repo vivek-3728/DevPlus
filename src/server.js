@@ -1,60 +1,36 @@
 // Application entry point: run with node src/server.js from the project root.
 // Request flow: JSON parser -> logger -> router -> controller -> service -> repository.
 // Responses travel back to the controller; errors go to the final error middleware.
-// Import the express framework for creating the server
-const express = require("express");
-require("dotenv").config();//load environment variables from .env file
-// Import custom middleware modules
-const logger = require("./middleware/logger"); // Middleware to log all HTTP requests
-const projectRoutes = require("./routes/projectRoutes"); // Routes for project API endpoints
-const authRoutes = require("./routes/authRoutes"); // Routes for registration and future authentication endpoints
-const errorHandler = require("./middleware/errorHandler"); // Middleware to handle application errors
-const { validateJwtConfig } = require("./config/auth"); // Validate required JWT environment configuration
-const { connectRedis, disconnectRedis } = require("./config/redis"); // Optional cache connection
+require("dotenv").config({ quiet: true });//load environment variables from .env file
+const { logger } = require("./utils/structuredLogger");
+const { validateEnvironment } = require("./config/environment");
+
+// Validate critical settings before creating clients or opening a network port.
+// Validation errors name variables but never include their secret values.
+let startupConfig;
+try {
+    startupConfig = validateEnvironment(process.env);
+} catch (error) {
+    logger.error("server.configuration_invalid", { message: error.message });
+    throw error;
+}
+
+const { createApp } = require("./app");
+const { connectRedis, disconnectRedis } = require("./config/redis");
 const { registerShutdownHandlers } = require("./services/serverLifecycle");
 const pool = require("./config/db");
+const { getErrorLogDetails } = require("./utils/errorDiagnostics");
 
-// Stop startup with a clear message when JWT_SECRET is missing or still uses the
-// public example value. Running without a private secret would break login and
-// make token verification insecure.
-validateJwtConfig();
-
-// Create an Express application instance
-const app = express();
+// The shared application factory installs security middleware, parsers, routes,
+// and centralized error handling in one consistently tested order.
+const app = createApp({ env: process.env, database: pool });
 
 // Define the port number where the server will listen
-const PORT = process.env.PORT || 5000;// Use the PORT from environment variables or default to 5000 if not set
-
-// Parse incoming JSON request bodies before any route runs. Express makes the
-// parsed values available to controllers through req.body.
-app.use(express.json());
-
-// Middleware to log every incoming request (must come before routes)
-app.use(logger);
-
-// Mount the project routes at the /api/projects path
-app.use("/api/projects", projectRoutes);
-
-// Mount authentication routes under /api/auth. The router's /register path
-// therefore becomes the complete endpoint POST /api/auth/register.
-app.use("/api/auth", authRoutes);
-
-// Define a health check endpoint to verify the server is running
-app.get("/api/health", (req, res) => { 
-    // Send a JSON response indicating the server is healthy and running
-    res.json({
-        status: "ok",
-        message: "DevPulse backend is running"
-    });
-});
-
-// Middleware to handle all application errors (must come after all other routes/middleware)
-app.use(errorHandler);
+const PORT = startupConfig.port;
 
 // Start the Express server and listen for incoming connections on the specified PORT
 const server = app.listen(PORT, () => {
-    // Log to console when the server starts successfully
-    console.log(`DevPulse running on port ${PORT}`);
+    logger.info("server.started", { port: Number(PORT) });
 });
 
 // Start Redis in the background instead of making HTTP startup depend on it.
@@ -64,14 +40,21 @@ connectRedis();
 // Close network/database resources on the normal container/terminal shutdown
 // signals. The helper deduplicates simultaneous signals and Redis remains
 // optional even during cleanup.
-registerShutdownHandlers({ server, pool, disconnectRedis });
+registerShutdownHandlers({
+    server,
+    pool,
+    disconnectRedis,
+    shutdownTimeoutMs: startupConfig.shutdownTimeoutMs
+});
 
 // This asynchronous database check runs after starting the HTTP listener.
 // A failure is logged; it does not stop the server or change /api/health.
 pool.query("SELECT NOW()")
-    .then(result => {
-        console.log("PostgreSQL connected:", result.rows[0]);
+    .then(() => {
+        logger.info("postgres.connected");
     })
     .catch(error => {
-        console.error("PostgreSQL connection failed:", error);
+        logger.error("postgres.connection_failed", {
+            error: getErrorLogDetails(error)
+        });
     });

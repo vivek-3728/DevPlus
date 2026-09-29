@@ -1,12 +1,54 @@
-const closeHttpServer = (server, logger) => new Promise(resolve => {
+const { getErrorLogMessage } = require("../utils/errorDiagnostics");
+const { logger: applicationLogger } = require("../utils/structuredLogger");
+
+const closeHttpServer = (server, logger, timeoutMs) => new Promise(resolve => {
+    let finished = false;
+    const finish = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        resolve();
+    };
+
+    // server.close() immediately stops new connections and waits for active
+    // responses. The deadline prevents a stuck client from blocking shutdown
+    // forever; only after it expires are remaining connections force-closed.
+    const timeout = setTimeout(() => {
+        logger.warn("server.shutdown_http_timeout", { timeoutMs });
+        try {
+            server.closeAllConnections?.();
+        } catch (error) {
+            logger.error("server.shutdown_http_force_close_failed", {
+                message: getErrorLogMessage(error)
+            });
+        } finally {
+            finish();
+        }
+    }, timeoutMs);
+    timeout.unref?.();
+
     try {
         server.close((error) => {
-            if (error) logger.error("HTTP shutdown failed:", error.message);
-            resolve();
+            if (error) logger.error("server.shutdown_http_failed", {
+                message: getErrorLogMessage(error)
+            });
+            finish();
         });
     } catch (error) {
-        logger.error("HTTP shutdown failed:", error.message);
-        resolve();
+        logger.error("server.shutdown_http_failed", {
+            message: getErrorLogMessage(error)
+        });
+        finish();
+    }
+
+    try {
+        server.closeIdleConnections?.();
+    } catch (error) {
+        // Failure to close an idle socket must not skip the grace period for
+        // active requests. The timeout remains responsible for final cleanup.
+        logger.error("server.shutdown_http_idle_close_failed", {
+            message: getErrorLogMessage(error)
+        });
     }
 });
 
@@ -15,7 +57,8 @@ const registerShutdownHandlers = ({
     server,
     pool,
     disconnectRedis,
-    logger = console,
+    shutdownTimeoutMs = 10000,
+    logger = applicationLogger,
     exit = code => process.exit(code)
 }) => {
     let shutdownPromise;
@@ -26,8 +69,9 @@ const registerShutdownHandlers = ({
         if (shutdownPromise) return shutdownPromise;
 
         shutdownPromise = (async () => {
-            logger.log(`Received ${signal}; closing DevPulse resources`);
-            await closeHttpServer(server, logger);
+            logger.info("server.shutdown_started", { signal });
+            await closeHttpServer(server, logger, shutdownTimeoutMs);
+            logger.info("server.shutdown_http_closed");
 
             // Redis is optional and PostgreSQL cleanup must still happen if its
             // disconnect fails, so cleanup tasks settle independently.
@@ -37,10 +81,13 @@ const registerShutdownHandlers = ({
             ]);
             for (const result of results) {
                 if (result.status === "rejected") {
-                    logger.error("Shutdown cleanup failed:", result.reason.message);
+                    logger.error("server.shutdown_cleanup_failed", {
+                        message: getErrorLogMessage(result.reason)
+                    });
                 }
             }
 
+            logger.info("server.shutdown_complete");
             exit(0);
         })();
 
@@ -53,4 +100,4 @@ const registerShutdownHandlers = ({
     return { shutdown };
 };
 
-module.exports = { registerShutdownHandlers };
+module.exports = { registerShutdownHandlers, closeHttpServer };
