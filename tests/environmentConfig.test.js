@@ -1,7 +1,10 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { validateEnvironment } = require("../src/config/environment");
+const {
+    validateEnvironment,
+    validateWorkerEnvironment
+} = require("../src/config/environment");
 
 const validEnvironment = {
     NODE_ENV: "production",
@@ -73,5 +76,23 @@ test("configuration failures never include supplied secrets", () => {
             assert.equal(error.message.includes("private-database-password"), false);
             return true;
         }
+    );
+});
+
+test("worker startup requires Redis but does not require JWT or CORS settings", () => {
+    const workerConfig = validateWorkerEnvironment({
+        NODE_ENV: "production",
+        DB_USER: "devpulse",
+        DB_HOST: "db.internal",
+        DB_NAME: "devpulse",
+        DB_PASSWORD: "private",
+        DB_PORT: "5432",
+        REDIS_URL: "rediss://queue-user:private@redis.internal:6380"
+    });
+    assert.equal(workerConfig.queue.queueName, "project-analytics");
+
+    assert.throws(
+        () => validateWorkerEnvironment({ ...validEnvironment, REDIS_URL: "" }),
+        /REDIS_URL is required for background job workers/
     );
 });

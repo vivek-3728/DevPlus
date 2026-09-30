@@ -2,6 +2,7 @@
 // Request flow: JSON parser -> logger -> router -> controller -> service -> repository.
 // Responses travel back to the controller; errors go to the final error middleware.
 require("dotenv").config({ quiet: true });//load environment variables from .env file
+const { createServer } = require("node:http");
 const { logger } = require("./utils/structuredLogger");
 const { validateEnvironment } = require("./config/environment");
 
@@ -20,16 +21,27 @@ const { connectRedis, disconnectRedis } = require("./config/redis");
 const { registerShutdownHandlers } = require("./services/serverLifecycle");
 const pool = require("./config/db");
 const { getErrorLogDetails } = require("./utils/errorDiagnostics");
+const {
+    closeProjectAnalyticsQueue
+} = require("./queues/projectAnalyticsQueue");
+const { createSocketServer, closeSocketServer } = require("./realtime/socketServer");
 
 // The shared application factory installs security middleware, parsers, routes,
 // and centralized error handling in one consistently tested order.
 const app = createApp({ env: process.env, database: pool });
+const server = createServer(app);
+const { io, projectEventPublisher } = createSocketServer({
+    httpServer: server,
+    env: process.env,
+    logger
+});
+app.set("projectEventPublisher", projectEventPublisher);
 
 // Define the port number where the server will listen
 const PORT = startupConfig.port;
 
 // Start the Express server and listen for incoming connections on the specified PORT
-const server = app.listen(PORT, () => {
+server.listen(PORT, () => {
     logger.info("server.started", { port: Number(PORT) });
 });
 
@@ -44,6 +56,8 @@ registerShutdownHandlers({
     server,
     pool,
     disconnectRedis,
+    closeJobQueue: closeProjectAnalyticsQueue,
+    closeRealtimeServer: () => closeSocketServer(io),
     shutdownTimeoutMs: startupConfig.shutdownTimeoutMs
 });
 

@@ -356,3 +356,47 @@ RELIABILITY AND HEALTH PROBES
   configurable grace period. Remaining sockets are force-closed after the
   deadline; Redis then closes and the PostgreSQL pool ends. Structured events
   record the start, timeout if any, HTTP closure, cleanup problems, and finish.
+
+BACKGROUND JOBS AND BULLMQ
+- A job is a small description of work to perform later. DevPulse queues the
+  project.analytics.snapshot job with only {projectId}; passwords, JWTs,
+  request bodies and full project objects never enter Redis as job data.
+- A queue is Redis-backed storage for pending jobs. The producer is the API-side
+  code that adds a job after normal project ownership authorization. HTTP 202
+  means Redis acknowledged the job, not that the report has finished. If Redis
+  is missing or unavailable, the endpoint returns 503 instead of claiming that
+  work was accepted and silently losing it.
+- A worker (also called a consumer) runs separately with npm run
+  worker:analytics. It waits for jobs, validates their name and exact payload,
+  loads the project through the repository, and returns a small deterministic
+  snapshot as BullMQ's job result.
+- BullMQ 6 can adapt the project's existing node-redis client. The API Queue
+  shares that non-blocking client and detaches before cache Redis shuts down.
+  The worker necessarily uses BullMQ-created duplicate connections because a
+  blocking wait for jobs must never block ordinary Redis commands; worker.close
+  owns and closes those duplicates during SIGINT/SIGTERM shutdown.
+- Redis remains optional for existing HTTP CRUD and caching fallback behavior.
+  It is required only to accept and process background jobs. The worker validates
+  REDIS_URL at startup, while an API without Redis continues serving PostgreSQL
+  endpoints and returns a safe 503 specifically for new job requests.
+- This first queue block uses exactly one attempt. Retries, backoff, dead-letter
+  queues, schedules, advanced job status APIs and monitoring are intentionally
+  deferred to later blocks.
+
+PHASE 7 BLOCK 3: SOCKET.IO REAL-TIME EVENTS
+
+- Socket.IO is attached to the same Node HTTP server as Express. Its handshake
+  begins over HTTP and may upgrade to a WebSocket, which keeps one connection
+  open so the server can send events without browser polling.
+- The handshake JWT is verified with the same helper as REST authentication.
+  The token is carried in socket.auth, never a query string, and is never logged.
+- A room is a server-managed group of sockets. DevPulse uses project:<id> for
+  explicit subscriptions, user:<id> for an owner's private events, and
+  role:admin for administrators. Clients cannot choose arbitrary room names.
+- The project:join event calls the normal project service before joining a room,
+  so the existing owner/admin rules also protect real-time subscriptions.
+- REST remains responsible for every mutation. project:created,
+  project:updated, and project:deleted are emitted only after PostgreSQL succeeds;
+  Socket.IO never writes projects and PostgreSQL remains the source of truth.
+- Real-time delivery is best-effort in this single API process. A delivery error
+  is logged but cannot turn an already committed REST write into a failure.

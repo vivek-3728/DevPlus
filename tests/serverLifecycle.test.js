@@ -3,7 +3,8 @@ const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 
 const {
-    registerShutdownHandlers
+    registerShutdownHandlers,
+    registerWorkerShutdownHandlers
 } = require("../src/services/serverLifecycle");
 
 test("shutdown closes HTTP, Redis, and PostgreSQL resources once", async () => {
@@ -19,6 +20,8 @@ test("shutdown closes HTTP, Redis, and PostgreSQL resources once", async () => {
         },
         pool: { end: async () => { calls.push("postgres"); } },
         disconnectRedis: async () => { calls.push("redis"); },
+        closeJobQueue: async () => { calls.push("queue"); },
+        closeRealtimeServer: async () => { calls.push("socket"); },
         logger: { info: () => {}, error: () => {} },
         exit: (code) => { calls.push(`exit:${code}`); }
     });
@@ -32,6 +35,8 @@ test("shutdown closes HTTP, Redis, and PostgreSQL resources once", async () => {
     ]);
 
     assert.equal(calls.filter(value => value === "http").length, 1);
+    assert.equal(calls.filter(value => value === "socket").length, 1);
+    assert.equal(calls.filter(value => value === "queue").length, 1);
     assert.equal(calls.filter(value => value === "redis").length, 1);
     assert.equal(calls.filter(value => value === "postgres").length, 1);
     assert.deepEqual(calls.at(-1), "exit:0");
@@ -90,4 +95,26 @@ test("shutdown gives active requests a deadline before forcing HTTP close", asyn
         "server.shutdown_http_timeout",
         { timeoutMs: 5 }
     ]]);
+});
+
+test("worker shutdown closes the consumer and resources only once", async () => {
+    const calls = [];
+    const lifecycle = registerWorkerShutdownHandlers({
+        processTarget: new EventEmitter(),
+        worker: { close: async () => { calls.push("worker"); } },
+        pool: { end: async () => { calls.push("postgres"); } },
+        disconnectRedis: async () => { calls.push("redis"); },
+        logger: { info() {}, warn() {}, error() {} },
+        exit: code => { calls.push(`exit:${code}`); }
+    });
+
+    await Promise.all([
+        lifecycle.shutdown("SIGTERM"),
+        lifecycle.shutdown("SIGINT")
+    ]);
+
+    assert.equal(calls.filter(value => value === "worker").length, 1);
+    assert.equal(calls.filter(value => value === "redis").length, 1);
+    assert.equal(calls.filter(value => value === "postgres").length, 1);
+    assert.equal(calls.at(-1), "exit:0");
 });

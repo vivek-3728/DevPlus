@@ -297,6 +297,9 @@ const deleteProject = async (id, actor) => {
     }
     await projectCache.invalidateProject(projectId, existingProject.owner_id);
     await projectCache.invalidateProjectLists(existingProject.owner_id);
+    // The controller needs only this safe routing metadata to notify authorized
+    // Socket.IO rooms after the deletion has committed.
+    return { id: project.id, owner_id: existingProject.owner_id };
 };
 
 module.exports = {

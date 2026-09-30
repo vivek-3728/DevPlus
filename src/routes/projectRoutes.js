@@ -12,6 +12,7 @@ router.use(authenticate, authorizeRoles("user", "admin"));
 router.get("/", projectController.getProjects); // Read the ordered project list.
 router.get("/:id", projectController.getProjectById); // Read one project.
 router.post("/", projectController.createProject); // Create; the database assigns an ID.
+router.post("/:id/analytics-jobs", projectController.createAnalyticsSnapshotJob);
 router.put("/:id", projectController.updateProject); // Replace name and environment.
 router.delete("/:id", projectController.deleteProject); // Delete one project.
 

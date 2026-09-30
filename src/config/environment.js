@@ -1,6 +1,7 @@
 const { getDatabaseConfig } = require("./database");
 const { validateJwtConfig } = require("./auth");
 const { validateSecurityConfig } = require("./security");
+const { getQueueConfig } = require("./queue");
 
 const VALID_NODE_ENVIRONMENTS = new Set(["development", "test", "production"]);
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10000;
@@ -42,13 +43,16 @@ const readReadinessTimeout = (value) => {
     return timeout;
 };
 
-const validateEnvironment = (env = process.env) => {
-    if (!env.NODE_ENV) {
-        throw new Error("NODE_ENV environment variable is required");
-    }
-    if (!VALID_NODE_ENVIRONMENTS.has(env.NODE_ENV)) {
+const readNodeEnvironment = (value) => {
+    if (!value) throw new Error("NODE_ENV environment variable is required");
+    if (!VALID_NODE_ENVIRONMENTS.has(value)) {
         throw new Error("NODE_ENV must be development, test, or production");
     }
+    return value;
+};
+
+const validateEnvironment = (env = process.env) => {
+    const nodeEnv = readNodeEnvironment(env.NODE_ENV);
 
     // Validation returns normalized configuration so startup and runtime use
     // the same checked values. Error messages name variables but never values.
@@ -57,7 +61,7 @@ const validateEnvironment = (env = process.env) => {
     const security = validateSecurityConfig(env);
 
     return {
-        nodeEnv: env.NODE_ENV,
+        nodeEnv,
         port: readApplicationPort(env.PORT),
         shutdownTimeoutMs: readShutdownTimeout(env.SHUTDOWN_TIMEOUT_MS),
         readinessTimeoutMs: readReadinessTimeout(env.READINESS_TIMEOUT_MS),
@@ -66,8 +70,16 @@ const validateEnvironment = (env = process.env) => {
     };
 };
 
+const validateWorkerEnvironment = (env = process.env) => ({
+    nodeEnv: readNodeEnvironment(env.NODE_ENV),
+    database: getDatabaseConfig(env),
+    queue: getQueueConfig(env, { requireRedis: true }),
+    shutdownTimeoutMs: readShutdownTimeout(env.SHUTDOWN_TIMEOUT_MS)
+});
+
 module.exports = {
     validateEnvironment,
+    validateWorkerEnvironment,
     readApplicationPort,
     readShutdownTimeout,
     readReadinessTimeout

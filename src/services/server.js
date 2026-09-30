@@ -4,6 +4,7 @@
 // Unlike src/server.js, this file does not run the SELECT NOW() database check.
 // Load .env before reading PORT; the database pool still uses hardcoded settings.
 require("dotenv").config({ quiet: true });
+const { createServer } = require("node:http");
 const { logger } = require("../utils/structuredLogger");
 const { validateEnvironment } = require("../config/environment");
 
@@ -19,8 +20,19 @@ const { createApp } = require("../app");
 const pool = require("../config/db");
 const { connectRedis, disconnectRedis } = require("../config/redis");
 const { registerShutdownHandlers } = require("./serverLifecycle");
+const {
+    closeProjectAnalyticsQueue
+} = require("../queues/projectAnalyticsQueue");
+const { createSocketServer, closeSocketServer } = require("../realtime/socketServer");
 
 const app = createApp({ env: process.env, database: pool });
+const server = createServer(app);
+const { io, projectEventPublisher } = createSocketServer({
+    httpServer: server,
+    env: process.env,
+    logger
+});
+app.set("projectEventPublisher", projectEventPublisher);
 // This is a separate Express application instance from the one in src/server.js.
 
 const PORT = startupConfig.port;
@@ -30,7 +42,7 @@ const PORT = startupConfig.port;
 // START SERVER
 // ======================================================
 
-const server = app.listen(PORT, () => {
+server.listen(PORT, () => {
     logger.info("server.started", { port: Number(PORT), entrypoint: "alternate" });
 });
 
@@ -39,5 +51,7 @@ registerShutdownHandlers({
     server,
     pool,
     disconnectRedis,
+    closeJobQueue: closeProjectAnalyticsQueue,
+    closeRealtimeServer: () => closeSocketServer(io),
     shutdownTimeoutMs: startupConfig.shutdownTimeoutMs
 });
